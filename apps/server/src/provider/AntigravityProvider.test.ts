@@ -824,7 +824,13 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         const harness = yield* makeHarness({ probeUsage: Ref.get(usage) });
         const published = yield* harness.nextPublish((snapshot) => !!snapshot.usageLimits);
         yield* harness.initialize;
-        expect((yield* published)?.usageLimits).toEqual(limits);
+        const first = yield* published;
+        expect(first?.usageLimits).toEqual(limits);
+        expect(first?.usageRead).toEqual({
+          attemptedAt: limits.checkedAt,
+          source: "probe",
+          outcome: "success",
+        });
         // The second health check is the one the failed background read triggers.
         const checks = yield* Ref.make(0);
         const failedReadApplied = yield* Deferred.make<void>();
@@ -844,9 +850,17 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
         });
         yield* harness.provider.snapshot.refresh;
         yield* Deferred.await(failedReadApplied);
-        expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toEqual(limits);
+        const afterFailure = yield* harness.provider.snapshot.getSnapshot;
+        expect(afterFailure.usageLimits).toEqual(limits);
+        // The failed attempt is explicit, so history records a gap without guessing.
+        expect(afterFailure.usageRead).toEqual({
+          attemptedAt: "2026-10-09T12:01:00.000Z",
+          source: "probe",
+          outcome: "failed",
+        });
         yield* harness.provider.onSignedOut;
         expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toBeUndefined();
+        expect((yield* harness.provider.snapshot.getSnapshot).usageRead).toBeUndefined();
         yield* Ref.set(usage, {
           checkedAt: "2026-10-09T12:02:00.000Z",
           windows: [],
@@ -856,7 +870,13 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
           (snapshot) => snapshot.usageLimits?.unavailable?.reason === "unsupported",
         );
         yield* harness.provider.snapshot.refresh;
-        expect((yield* unsupported)?.usageLimits?.windows).toEqual([]);
+        const unsupportedSnapshot = yield* unsupported;
+        expect(unsupportedSnapshot?.usageLimits?.windows).toEqual([]);
+        expect(unsupportedSnapshot?.usageRead).toEqual({
+          attemptedAt: "2026-10-09T12:02:00.000Z",
+          source: "probe",
+          outcome: "unsupported",
+        });
       }),
   );
 
@@ -912,6 +932,66 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
       } satisfies ServerProviderUsageLimits;
       yield* Deferred.succeed(readResult, limits);
       expect((yield* published)?.usageLimits).toEqual(limits);
+    }),
+  );
+
+  it.effect("shares background quota results with the foreground snapshot", () =>
+    Effect.gen(function* () {
+      const makeLimits = (minute: string, usedPercent: number): ServerProviderUsageLimits => ({
+        checkedAt: `2026-10-09T12:${minute}:00.000Z`,
+        windows: [{ id: "gemini-5h", kind: "session", label: "Gemini", usedPercent }],
+      });
+      const baseline = makeLimits("00", 10);
+      const fresh = makeLimits("01", 20);
+      const usage = yield* Ref.make(baseline);
+      const harness = yield* makeHarness({ probeUsage: Ref.get(usage) });
+      const first = yield* harness.nextPublish((snapshot) => snapshot.usageLimits === baseline);
+      yield* harness.initialize;
+      yield* first;
+      yield* Ref.set(usage, fresh);
+      yield* harness.provider.snapshot.sampleUsage!;
+      const snapshot = yield* harness.provider.snapshot.getSnapshot;
+      expect(snapshot.usageLimits).toEqual(fresh);
+      expect(snapshot.usageRead?.attemptedAt).toBe(fresh.checkedAt);
+    }),
+  );
+
+  it.effect("ignores a background quota response that arrives after sign-out", () =>
+    Effect.gen(function* () {
+      const baseline = {
+        checkedAt: "2026-10-09T12:00:00.000Z",
+        windows: [{ id: "gemini-5h", kind: "session", label: "Gemini", usedPercent: 10 }],
+      } satisfies ServerProviderUsageLimits;
+      const startedRead = yield* Deferred.make<void>();
+      const finishRead = yield* Deferred.make<ServerProviderUsageLimits>();
+      const usage = yield* Ref.make<Effect.Effect<ServerProviderUsageLimits>>(
+        Effect.succeed(baseline),
+      );
+      const harness = yield* makeHarness({ probeUsage: Ref.get(usage).pipe(Effect.flatten) });
+      const first = yield* harness.nextPublish((snapshot) => snapshot.usageLimits === baseline);
+      yield* harness.initialize;
+      yield* first;
+      yield* Ref.set(
+        usage,
+        Deferred.succeed(startedRead, undefined).pipe(Effect.andThen(Deferred.await(finishRead))),
+      );
+      const late = { ...baseline, checkedAt: "2026-10-09T12:01:00.000Z" };
+      const published = yield* Ref.make(false);
+      yield* harness.provider.snapshot.streamChanges.pipe(
+        Stream.runForEach((snapshot) =>
+          snapshot.usageRead?.attemptedAt === late.checkedAt
+            ? Ref.set(published, true)
+            : Effect.void,
+        ),
+        Effect.forkChild({ startImmediately: true }),
+      );
+      const sample = yield* harness.provider.snapshot.sampleUsage!.pipe(Effect.forkChild);
+      yield* Deferred.await(startedRead);
+      yield* harness.provider.onSignedOut;
+      yield* Deferred.succeed(finishRead, late);
+      yield* Fiber.join(sample);
+      expect(yield* Ref.get(published)).toBe(false);
+      expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toBeUndefined();
     }),
   );
 

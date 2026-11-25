@@ -648,16 +648,32 @@ describe("readOpenCodeUsage", () => {
       assert.deepStrictEqual(
         result.files
           .flatMap((file) => file.records)
-          .map(({ model, rateModel, reportedCostUsd }) => ({ model, rateModel, reportedCostUsd }))
+          .map(({ model, rateModel, upstreamProviderId, reportedCostUsd }) => ({
+            model,
+            rateModel,
+            upstreamProviderId,
+            reportedCostUsd,
+          }))
           .sort((a, b) => a.model.localeCompare(b.model)),
         [
           {
             model: "deepseek-v4.1-flash",
             rateModel: "opencode_go/deepseek-v4.1-flash",
+            upstreamProviderId: "opencode-go",
             reportedCostUsd: null,
           },
-          { model: "deepseek-v4.1-flash-free", rateModel: undefined, reportedCostUsd: 0 },
-          { model: "glm-5.3", rateModel: "opencode_go/glm-5.3", reportedCostUsd: null },
+          {
+            model: "deepseek-v4.1-flash-free",
+            rateModel: undefined,
+            upstreamProviderId: "opencode",
+            reportedCostUsd: 0,
+          },
+          {
+            model: "glm-5.3",
+            rateModel: "opencode_go/glm-5.3",
+            upstreamProviderId: "opencode-go",
+            reportedCostUsd: null,
+          },
         ],
       );
     }).pipe(Effect.provide(NodeServices.layer)),

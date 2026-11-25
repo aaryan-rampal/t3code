@@ -1,6 +1,7 @@
 import type {
   ProviderUsageLimitsUpdate,
   ServerProviderUsageLimits,
+  ServerProviderUsageRead,
   ServerProviderUsageWindow,
 } from "@t3tools/contracts";
 
@@ -32,6 +33,27 @@ export function makeUsageLimits(input: {
   return { checkedAt: input.checkedAt, windows: sortWindows(input.windows) };
 }
 
+/** A read that reports windows succeeded even if an earlier failure marker survived. */
+function usageReadOutcome(
+  limits: ServerProviderUsageLimits | undefined,
+): ServerProviderUsageRead["outcome"] {
+  if (limits === undefined) return "failed";
+  if (limits.windows.length > 0) return "success";
+  return limits.unavailable?.reason === "unsupported" ? "unsupported" : "failed";
+}
+
+export function makeUsageRead(input: {
+  readonly attemptedAt: string;
+  readonly source: ServerProviderUsageRead["source"];
+  readonly usageLimits: ServerProviderUsageLimits | undefined;
+}): ServerProviderUsageRead {
+  return {
+    attemptedAt: input.attemptedAt,
+    source: input.source,
+    outcome: usageReadOutcome(input.usageLimits),
+  };
+}
+
 export function makeUnavailableUsageLimits(input: {
   readonly checkedAt: string;
   readonly reason: "unsupported" | "probeFailed";
@@ -53,6 +75,8 @@ export function applyUsageLimitsUpdate(input: {
   readonly checkedAt: string;
 }): ServerProviderUsageLimits | undefined {
   const { previous, update } = input;
+  // An unsupported account has no streamed reading to merge; its provider states
+  // that fact on every full check and would undo any windows a push installed.
   if (update.windows.length === 0 || previous?.unavailable?.reason === "unsupported") {
     return previous;
   }
@@ -70,6 +94,12 @@ export function applyUsageLimitsUpdate(input: {
       ...(window.windowDurationMins === undefined && existing?.windowDurationMins !== undefined
         ? { windowDurationMins: existing.windowDurationMins }
         : {}),
+      ...(window.spent === undefined && existing?.spent !== undefined
+        ? { spent: existing.spent }
+        : {}),
+      ...(window.limit === undefined && existing?.limit !== undefined
+        ? { limit: existing.limit }
+        : {}),
     };
     if (existing === undefined || !usageWindowEquals(existing, next)) {
       merged.set(window.id, next);
@@ -79,13 +109,17 @@ export function applyUsageLimitsUpdate(input: {
   if (!changed && previous !== undefined) {
     return previous;
   }
-  const unavailable =
-    previous === undefined ? { reason: "probeFailed" as const } : previous.unavailable;
+  // A sparse push must not hide an unresolved probe failure; only a full reading clears it.
   return {
     ...makeUsageLimits({ checkedAt: input.checkedAt, windows: merged.values() }),
+    ...(previous?.unavailable !== undefined ? { unavailable: previous.unavailable } : {}),
     ...(previous?.resetCredits !== undefined ? { resetCredits: previous.resetCredits } : {}),
     ...(previous?.zeroSpendCap ? { zeroSpendCap: true } : {}),
-    ...(unavailable !== undefined ? { unavailable } : {}),
+    ...(previous?.accountKey !== undefined ? { accountKey: previous.accountKey } : {}),
+    ...(previous?.credentialFingerprint !== undefined
+      ? { credentialFingerprint: previous.credentialFingerprint }
+      : {}),
+    ...(previous?.externalUsage !== undefined ? { externalUsage: previous.externalUsage } : {}),
   };
 }
 
@@ -106,7 +140,9 @@ function usageWindowEquals(a: ServerProviderUsageWindow, b: ServerProviderUsageW
         a.providerIds.length === b.providerIds.length &&
         a.providerIds.every((id, index) => id === b.providerIds?.[index]))) &&
     a.resetsAt === b.resetsAt &&
-    a.windowDurationMins === b.windowDurationMins
+    a.windowDurationMins === b.windowDurationMins &&
+    a.spent === b.spent &&
+    a.limit === b.limit
   );
 }
 
@@ -115,7 +151,13 @@ export function resolveUsageLimitsAfterProbe(input: {
   readonly probed: ServerProviderUsageLimits | undefined;
 }): ServerProviderUsageLimits | undefined {
   const { published, probed } = input;
-  if (probed?.unavailable?.reason === "probeFailed" && published && !published.unavailable) {
+  // A failed probe keeps the last good windows. A sparse push may have installed
+  // them beside a recovery marker, so the marker alone does not make them stale.
+  if (
+    probed?.unavailable?.reason === "probeFailed" &&
+    published !== undefined &&
+    published.unavailable?.reason !== "unsupported"
+  ) {
     return published;
   }
   if (

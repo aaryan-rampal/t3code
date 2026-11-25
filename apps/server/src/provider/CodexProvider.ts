@@ -50,7 +50,10 @@ import {
   type ServerProviderDraft,
 } from "@t3tools/provider-core/server/snapshotProbe";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
-import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
+import {
+  makeUnavailableUsageLimits,
+  makeUsageRead,
+} from "@t3tools/provider-core/server/usageLimits";
 import {
   codexRateLimitsFailureMessage,
   codexRateLimitsToLimits,
@@ -1083,42 +1086,72 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
           environment: resolvedEnvironment,
         })
       : null;
-    return buildServerProvider({
-      presentation: CODEX_PRESENTATION,
-      enabled: codexSettings.enabled,
-      checkedAt,
-      models: emptyModels,
-      skills: [],
-      probe: {
-        installed,
-        version,
-        status: "error",
-        auth: { status: "unknown" },
-        message: installed
-          ? `Codex app-server provider probe failed: ${error.message}.`
-          : `Could not start Codex CLI (\`${codexSettings.binaryPath}\`). Check Settings → Providers → Codex → Binary path on the server.` +
-            (codexSettings.binaryPath === "codex"
-              ? " Installing ChatGPT or Codex desktop may not add codex to PATH."
-              : " Make sure the configured executable exists and can be run."),
-      },
-    });
+    return {
+      ...buildServerProvider({
+        presentation: CODEX_PRESENTATION,
+        enabled: codexSettings.enabled,
+        checkedAt,
+        models: emptyModels,
+        skills: [],
+        probe: {
+          installed,
+          version,
+          status: "error",
+          auth: { status: "unknown" },
+          message: installed
+            ? `Codex app-server provider probe failed: ${error.message}.`
+            : `Could not start Codex CLI (\`${codexSettings.binaryPath}\`). Check Settings → Providers → Codex → Binary path on the server.` +
+              (codexSettings.binaryPath === "codex"
+                ? " Installing ChatGPT or Codex desktop may not add codex to PATH."
+                : " Make sure the configured executable exists and can be run."),
+          // Managed Codex reads usage from pushes, so only the local probe reports a failure.
+          ...(installed && !managedAuth
+            ? { usageLimits: makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed" }) }
+            : {}),
+        },
+      }),
+      // A failed app-server probe over an installed CLI is also a failed usage read.
+      ...(installed && !managedAuth
+        ? {
+            usageRead: makeUsageRead({
+              attemptedAt: checkedAt,
+              source: "probe",
+              usageLimits: undefined,
+            }),
+          }
+        : {}),
+    };
   }
 
   if (Option.isNone(probeResult.success)) {
-    return buildServerProvider({
-      presentation: CODEX_PRESENTATION,
-      enabled: codexSettings.enabled,
-      checkedAt,
-      models: emptyModels,
-      skills: [],
-      probe: {
-        installed: true,
-        version: null,
-        status: "error",
-        auth: { status: "unknown" },
-        message: "Timed out while checking Codex app-server provider status.",
-      },
-    });
+    return {
+      ...buildServerProvider({
+        presentation: CODEX_PRESENTATION,
+        enabled: codexSettings.enabled,
+        checkedAt,
+        models: emptyModels,
+        skills: [],
+        probe: {
+          installed: true,
+          version: null,
+          status: "error",
+          auth: { status: "unknown" },
+          message: "Timed out while checking Codex app-server provider status.",
+          ...(managedAuth
+            ? {}
+            : { usageLimits: makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed" }) }),
+        },
+      }),
+      ...(managedAuth
+        ? {}
+        : {
+            usageRead: makeUsageRead({
+              attemptedAt: checkedAt,
+              source: "probe",
+              usageLimits: undefined,
+            }),
+          }),
+    };
   }
 
   const snapshot = probeResult.success.value;
@@ -1148,45 +1181,57 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
             checkedAt,
           });
 
-  return buildServerProvider({
-    presentation: CODEX_PRESENTATION,
-    enabled: codexSettings.enabled,
-    checkedAt,
-    models: pipe(
-      appendCustomCodexModels(snapshot.models ?? [], codexSettings.customModels),
-      applyPreferredCodexDefaultModel,
-      (models) => applyConfiguredCodexServiceTier(models, snapshot.serviceTier),
-      (models) => applyConfiguredCodexCyberAccess(models, snapshot),
-    ),
-    skills: snapshot.skills,
-    slashCommands: [
-      COMPACT_SLASH_COMMAND,
-      {
-        name: "goal",
-        description: "Set a goal Codex keeps working toward until it is done",
-        input: { hint: "Objective, or pause, resume, clear" },
+  return {
+    ...buildServerProvider({
+      presentation: CODEX_PRESENTATION,
+      enabled: codexSettings.enabled,
+      checkedAt,
+      models: pipe(
+        appendCustomCodexModels(snapshot.models ?? [], codexSettings.customModels),
+        applyPreferredCodexDefaultModel,
+        (models) => applyConfiguredCodexServiceTier(models, snapshot.serviceTier),
+        (models) => applyConfiguredCodexCyberAccess(models, snapshot),
+      ),
+      skills: snapshot.skills,
+      slashCommands: [
+        COMPACT_SLASH_COMMAND,
+        {
+          name: "goal",
+          description: "Set a goal Codex keeps working toward until it is done",
+          input: { hint: "Objective, or pause, resume, clear" },
+        },
+        {
+          name: "feedback",
+          description: "Send this thread and Codex logs to OpenAI",
+          input: { hint: "Describe the issue (optional)" },
+        },
+      ],
+      probe: {
+        installed: true,
+        version: snapshot.version ?? null,
+        status: snapshot.models === undefined ? "warning" : accountStatus.status,
+        auth: snapshot.endpoint
+          ? { ...accountStatus.auth, endpoint: snapshot.endpoint }
+          : accountStatus.auth,
+        ...(accountStatus.message
+          ? { message: accountStatus.message }
+          : snapshot.models === undefined
+            ? { message: "Codex did not return its model catalog in time." }
+            : {}),
+        ...(managedAuth ? {} : { usageLimits }),
       },
-      {
-        name: "feedback",
-        description: "Send this thread and Codex logs to OpenAI",
-        input: { hint: "Describe the issue (optional)" },
-      },
-    ],
-    probe: {
-      installed: true,
-      version: snapshot.version ?? null,
-      status: snapshot.models === undefined ? "warning" : accountStatus.status,
-      auth: snapshot.endpoint
-        ? { ...accountStatus.auth, endpoint: snapshot.endpoint }
-        : accountStatus.auth,
-      ...(accountStatus.message
-        ? { message: accountStatus.message }
-        : snapshot.models === undefined
-          ? { message: "Codex did not return its model catalog in time." }
-          : {}),
-      ...(managedAuth ? {} : { usageLimits }),
-    },
-  });
+    }),
+    // Managed Codex reports usage through pushes; only a local probe is a read.
+    ...(managedAuth
+      ? {}
+      : {
+          usageRead: makeUsageRead({
+            attemptedAt: checkedAt,
+            source: "probe",
+            usageLimits,
+          }),
+        }),
+  };
 });
 
 export { makePendingCodexProvider };

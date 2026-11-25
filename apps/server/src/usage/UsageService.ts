@@ -68,6 +68,10 @@ import {
   type CachedFile,
   type ScanCache,
 } from "./usageScanCache.ts";
+import {
+  applySharedSessionOccurrenceKey,
+  findSharedSessionIds,
+} from "./usageRecordSharedSessions.ts";
 
 const LITELLM_RATES_URL =
   "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
@@ -135,25 +139,6 @@ const sharedSessionProviders: ReadonlySet<UsageProviderKind> = new Set(
   ),
 );
 
-// Only shared sessions need cross-file dedupe; per-file occurrence counts make other keys unique.
-function sharedSessions(
-  files: readonly { readonly records: readonly UsageRecord[] }[],
-): ReadonlySet<string> {
-  const firstFile = new Map<string, number>();
-  const shared = new Set<string>();
-  for (const [index, file] of files.entries()) {
-    let previous = "";
-    for (const { provider, sessionId } of file.records) {
-      if (!sharedSessionProviders.has(provider) || sessionId === previous || sessionId.length === 0)
-        continue;
-      previous = sessionId;
-      const first = firstFile.get(sessionId);
-      if (first === undefined) firstFile.set(sessionId, index);
-      else if (first !== index) shared.add(sessionId);
-    }
-  }
-  return shared;
-}
 const decodeCachedSources = Schema.decodeUnknownOption(
   Schema.Struct({
     sources: Schema.Record(Schema.String, CachedSource),
@@ -1069,7 +1054,7 @@ export const make = Effect.gen(function* () {
         cacheDirty = true;
       }
     }
-    const crossFileSessions = sharedSessions(filesByDir.flat());
+    const crossFileSessions = findSharedSessionIds(filesByDir.flat(), sharedSessionProviders);
 
     for (const [
       index,
@@ -1109,16 +1094,7 @@ export const make = Effect.gen(function* () {
             crossFileSessions.has(record.sessionId)
           ) {
             // Dedupe moved copies but retain repeated equal events within a file, including second-precision timestamps.
-            const key = encodeUsageRecordKey([
-              record.provider,
-              record.sessionId,
-              record.timestampMs,
-              record.model,
-              record.totals,
-            ]);
-            const occurrence = (eventOccurrences.get(key) ?? 0) + 1;
-            eventOccurrences.set(key, occurrence);
-            usageRecord = { ...record, dedupeKey: key + ":" + occurrence };
+            usageRecord = applySharedSessionOccurrenceKey(record, eventOccurrences);
           }
           if (aggregator.add(usageRecord, dir)) {
             counted = true;

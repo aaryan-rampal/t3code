@@ -54,6 +54,7 @@ import {
   type OpenCode2Model,
 } from "./status.ts";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
+import { makeUsageRead } from "@t3tools/provider-core/server/usageLimits";
 import * as OpenCodeRuntime from "./OpenCodeRuntime.ts";
 import {
   makeOpenCodeRuntimeProbe,
@@ -560,6 +561,11 @@ export const OpenCodeDriver: ProviderDriver<
       Effect.map(({ provider, usageLimits, installedVersion }) => ({
         ...provider,
         usageLimits,
+        usageRead: makeUsageRead({
+          attemptedAt: usageLimits.checkedAt,
+          source: "probe",
+          usageLimits,
+        }),
         ...(installedVersion === undefined ? {} : { installedVersion }),
       })),
       Effect.map(stampIdentity),
@@ -681,6 +687,15 @@ export const OpenCodeDriver: ProviderDriver<
         snapshot.installed &&
         snapshot.status !== "ready" &&
         snapshot.auth.status === "unknown",
+      // A ready OpenCode server still needs the five-minute quota sample, but it
+      // must not be restarted or re-probed just to read usage.
+      refreshUsageOnInterval: (snapshot) =>
+        snapshot.enabled &&
+        snapshot.installed &&
+        snapshot.status === "ready" &&
+        snapshot.auth.status === "authenticated" &&
+        snapshot.usageLimits !== undefined &&
+        snapshot.usageLimits.unavailable?.reason !== "unsupported",
       initialSnapshot: (settings) =>
         makePendingOpenCodeProvider(settings.provider).pipe(Effect.map(stampIdentity)),
       checkProvider,

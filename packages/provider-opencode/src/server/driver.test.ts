@@ -92,7 +92,8 @@ const create = (config: Partial<OpenCodeSettings>, http: HttpClient.HttpClient, 
   OpenCodeDriver.create({
     instanceId: ProviderInstanceId.make("opencode-test"),
     displayName: undefined,
-    environment: [],
+    // Never read the machine's live OpenCode login while exercising provider behaviour.
+    environment: [{ name: "OPENCODE_AUTH_CONTENT", sensitive: true, value: "{}" }],
     enabled,
     config: { ...OpenCodeDriver.defaultConfig(), ...config },
   }).pipe(Effect.provideService(HttpClient.HttpClient, http));
@@ -1270,8 +1271,17 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
       );
       assert.strictEqual(modelReads, catalogReads);
       assert.strictEqual(serverStarts, starts);
-      yield* TestClock.adjust("15 minutes");
-      assert.strictEqual(usageReads, expectedReads);
+      if (shouldRecover) {
+        assert.strictEqual(recovered.usageRead?.source, "probe");
+        assert.strictEqual(recovered.usageRead?.outcome, "success");
+      }
+      for (let index = 0; index < 3; index += 1) {
+        yield* TestClock.adjust("5 minutes");
+        yield* Effect.yieldNow;
+      }
+      // A healthy instance keeps the five-minute sample without a server restart.
+      const periodicReads = shouldRecover ? 3 : 0;
+      assert.strictEqual(usageReads, expectedReads + periodicReads);
       assert.strictEqual(modelReads, catalogReads);
       assert.strictEqual(serverStarts, starts);
     }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
@@ -1546,7 +1556,7 @@ it.layer(layerUpdate)("OpenCodeDriver updates", (it) => {
         const instance = yield* OpenCodeDriver.create({
           instanceId: ProviderInstanceId.make("opencode-update"),
           displayName: undefined,
-          environment: [],
+          environment: [{ name: "OPENCODE_AUTH_CONTENT", sensitive: true, value: "{}" }],
           enabled: true,
           config: { ...OpenCodeDriver.defaultConfig(), binaryPath },
         }).pipe(Effect.provideService(HttpClient.HttpClient, noHttp));

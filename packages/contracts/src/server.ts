@@ -27,7 +27,11 @@ import { ManagedPolicySummary } from "./managedPolicy.ts";
 import { ModelCapabilities, ProviderOptionDescriptor } from "./model.ts";
 import { RuntimeMode } from "./providerPolicy.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
-import { ServerProviderUsageLimits, UsageLimitSourceSnapshots } from "./providerUsageLimits.ts";
+import {
+  ServerProviderUsageLimits,
+  ServerProviderUsageRead,
+  UsageLimitSourceSnapshots,
+} from "./providerUsageLimits.ts";
 import { ServerSettings } from "./settings.ts";
 import { DesktopUpdateChannelSchema } from "./ipc.ts";
 
@@ -294,6 +298,12 @@ export const ServerProvider = Schema.Struct({
    */
   workspaceRescannedAt: Schema.optionalKey(IsoDateTime),
   usageLimits: Schema.optional(ServerProviderUsageLimits),
+  /**
+   * The last usage read attempt, even when it failed and `usageLimits` still carries
+   * the last good values. Local history uses it to record failures without inferring
+   * them from `checkedAt`.
+   */
+  usageRead: Schema.optional(ServerProviderUsageRead),
   versionAdvisory: Schema.optionalKey(ServerProviderVersionAdvisory),
   compatibilityAdvisory: Schema.optionalKey(ServerProviderCompatibilityAdvisory),
   updateState: Schema.optionalKey(ServerProviderUpdateState),

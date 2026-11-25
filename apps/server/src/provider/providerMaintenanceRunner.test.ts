@@ -230,6 +230,8 @@ function makeRegistry(
         Effect.succeed(lifecycleFor(provider)),
       setProviderMaintenanceActionState,
       streamChanges: Stream.empty,
+      subscribeChanges: Effect.never,
+      sampleUsage: () => Effect.void,
     };
 
     return {

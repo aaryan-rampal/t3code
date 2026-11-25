@@ -222,6 +222,32 @@ describe("BackgroundPolicy", () => {
     ),
   );
 
+  it.effect("runs usage sampling for a connected unfocused client but not a locked host", () => {
+    const report = makeReport({ focused: false, recentlyInteracted: false });
+    return Effect.gen(function* () {
+      const policy = yield* BackgroundPolicy.BackgroundPolicy;
+      yield* policy.reportClientActivity(
+        AuthSessionId.make("session-1"),
+        RpcClientId.make(1),
+        report,
+      );
+      assert.isTrue(yield* policy.shouldRunUsageSampling);
+    }).pipe(
+      Effect.provide(layerFor(nominalHostPower)),
+      Effect.andThen(
+        Effect.gen(function* () {
+          const policy = yield* BackgroundPolicy.BackgroundPolicy;
+          yield* policy.reportClientActivity(
+            AuthSessionId.make("session-1"),
+            RpcClientId.make(1),
+            report,
+          );
+          assert.isFalse(yield* policy.shouldRunUsageSampling);
+        }).pipe(Effect.provide(layerFor({ ...nominalHostPower, stale: false, locked: "true" }))),
+      ),
+    );
+  });
+
   it.effect("does not gate work on stale host power values", () =>
     Effect.gen(function* () {
       const policy = yield* BackgroundPolicy.BackgroundPolicy;
