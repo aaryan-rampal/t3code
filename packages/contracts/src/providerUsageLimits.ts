@@ -82,6 +82,7 @@ export const ServerProviderUsageRead = Schema.Struct({
   attemptedAt: IsoDateTime,
   source: Schema.Literals(["probe", "notification"]),
   outcome: Schema.Literals(["success", "failed", "unsupported"]),
+  windowIds: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
 });
 export type ServerProviderUsageRead = typeof ServerProviderUsageRead.Type;
 

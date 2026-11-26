@@ -59,7 +59,10 @@ import {
   readClaudeSettingsEnv,
 } from "./Drivers/ClaudeSkills.ts";
 import type { ProviderWorkspaceSnapshot } from "@t3tools/provider-core/server/driver";
-import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
+import {
+  makeUnavailableUsageLimits,
+  makeUsageRead,
+} from "@t3tools/provider-core/server/usageLimits";
 import {
   type ClaudeScopedLimitNames,
   claudeUsageResponseToLimits,
@@ -211,7 +214,7 @@ function apiProviderAuthMetadata(
 }
 
 /** Probe completion only proves Claude started. Only tokenSource: "none" disproves auth. */
-function claudeAuthStatus(
+export function claudeAuthStatus(
   capabilities: Pick<
     ClaudeCapabilitiesProbe,
     "email" | "subscriptionType" | "tokenSource" | "apiKeySource" | "apiProvider"
@@ -664,6 +667,45 @@ export const probeClaudeWorkspaceSnapshot = Effect.fn("probeClaudeWorkspaceSnaps
   };
 });
 
+export const resolveClaudeCapabilitiesUsageLimits = Effect.fn(
+  "resolveClaudeCapabilitiesUsageLimits",
+)(function* (input: {
+  readonly capabilities: Pick<
+    ClaudeCapabilitiesProbe,
+    "usage" | "usageCheckedAt" | "subscriptionType"
+  >;
+  readonly checkedAt: string;
+  readonly scopedLimitNames?: Ref.Ref<ClaudeScopedLimitNames>;
+  readonly version?: string | null | undefined;
+  readonly resolveResetCredits?: (
+    version: string,
+  ) => Effect.Effect<ServerProviderResetCredits | undefined>;
+}) {
+  const usageCheckedAt = input.capabilities.usageCheckedAt ?? input.checkedAt;
+  const usageLimits = !input.capabilities.usage
+    ? makeUnavailableUsageLimits({ checkedAt: input.checkedAt, reason: "probeFailed" })
+    : input.scopedLimitNames
+      ? yield* recordClaudeUsageResponse(input.scopedLimitNames, {
+          response: input.capabilities.usage,
+          checkedAt: usageCheckedAt,
+        })
+      : claudeUsageResponseToLimits({
+          response: input.capabilities.usage,
+          checkedAt: usageCheckedAt,
+        }).limits;
+  const resetCredits =
+    input.resolveResetCredits &&
+    input.capabilities.subscriptionType &&
+    !usageLimits.unavailable &&
+    input.version
+      ? yield* input.resolveResetCredits(input.version)
+      : undefined;
+  return {
+    usageLimits: resetCredits ? { ...usageLimits, resetCredits } : usageLimits,
+    attemptedAt: input.capabilities.usage ? usageCheckedAt : input.checkedAt,
+  };
+});
+
 export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(function* (
   claudeSettings: ClaudeSettings,
   resolveCapabilities?: (
@@ -803,26 +845,40 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
   const dedupedSlashCommands = dedupeSlashCommands(slashCommands);
 
   if (!capabilities) {
-    return buildServerProvider({
-      presentation: CLAUDE_PRESENTATION,
-      enabled: claudeSettings.enabled,
-      checkedAt,
-      models,
-      updateRequiredModels,
-      slashCommands: dedupedSlashCommands,
-      skills,
-      probe: {
-        installed: true,
-        version: parsedVersion,
-        status: "warning",
-        auth: { status: "unknown" },
-        message: probeFailure
-          ? Cause.isTimeoutError(probeFailure)
-            ? `Timed out after ${resolveProviderProbeTimeoutMs("claude", CAPABILITIES_PROBE_TIMEOUT_MS, resolvedEnvironment) / 1_000}s while checking Claude account status.`
-            : "Claude Agent CLI failed while checking account status."
-          : "Could not verify Claude authentication status from initialization result.",
-      },
-    });
+    return {
+      ...buildServerProvider({
+        presentation: CLAUDE_PRESENTATION,
+        enabled: claudeSettings.enabled,
+        checkedAt,
+        models,
+        updateRequiredModels,
+        slashCommands: dedupedSlashCommands,
+        skills,
+        probe: {
+          installed: true,
+          version: parsedVersion,
+          status: "warning",
+          auth: { status: "unknown" },
+          message: probeFailure
+            ? Cause.isTimeoutError(probeFailure)
+              ? `Timed out after ${resolveProviderProbeTimeoutMs("claude", CAPABILITIES_PROBE_TIMEOUT_MS, resolvedEnvironment) / 1_000}s while checking Claude account status.`
+              : "Claude Agent CLI failed while checking account status."
+            : "Could not verify Claude authentication status from initialization result.",
+          ...(resolveCapabilities
+            ? { usageLimits: makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed" }) }
+            : {}),
+        },
+      }),
+      ...(resolveCapabilities
+        ? {
+            usageRead: makeUsageRead({
+              attemptedAt: checkedAt,
+              source: "probe",
+              usageLimits: undefined,
+            }),
+          }
+        : {}),
+    };
   }
 
   // First-party account fields cannot verify custom endpoint credentials.
@@ -867,47 +923,43 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
       authMethod: capabilities.tokenSource,
       apiKeySource: capabilities.apiKeySource,
     });
-  const usageCheckedAt = capabilities.usageCheckedAt ?? checkedAt;
-  const usageLimits = !capabilities.usage
-    ? makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed" })
-    : scopedLimitNames
-      ? yield* recordClaudeUsageResponse(scopedLimitNames, {
-          response: capabilities.usage,
-          checkedAt: usageCheckedAt,
-        })
-      : claudeUsageResponseToLimits({
-          response: capabilities.usage,
-          checkedAt: usageCheckedAt,
-        }).limits;
-  const resetCredits =
-    resolveResetCredits &&
-    capabilities.subscriptionType &&
-    !usageLimits.unavailable &&
-    parsedVersion
-      ? yield* resolveResetCredits(parsedVersion)
-      : undefined;
-  return buildServerProvider({
-    presentation: CLAUDE_PRESENTATION,
-    enabled: claudeSettings.enabled,
-    checkedAt,
-    models,
-    updateRequiredModels,
-    slashCommands: dedupedSlashCommands,
-    skills,
-    probe: {
-      installed: true,
+  const { usageLimits: finalUsageLimits, attemptedAt } =
+    yield* resolveClaudeCapabilitiesUsageLimits({
+      capabilities,
+      checkedAt,
+      ...(scopedLimitNames ? { scopedLimitNames } : {}),
       version: parsedVersion,
-      status: "ready",
-      auth: {
-        status: "authenticated",
-        ...(capabilities.email ? { email: capabilities.email } : {}),
-        ...(capabilities.workspaceId ? { workspaceId: capabilities.workspaceId } : {}),
-        ...(authMetadata ? authMetadata : {}),
+      ...(resolveResetCredits ? { resolveResetCredits } : {}),
+    });
+  return {
+    ...buildServerProvider({
+      presentation: CLAUDE_PRESENTATION,
+      enabled: claudeSettings.enabled,
+      checkedAt,
+      models,
+      updateRequiredModels,
+      slashCommands: dedupedSlashCommands,
+      skills,
+      probe: {
+        installed: true,
+        version: parsedVersion,
+        status: "ready",
+        auth: {
+          status: "authenticated",
+          ...(capabilities.email ? { email: capabilities.email } : {}),
+          ...(capabilities.workspaceId ? { workspaceId: capabilities.workspaceId } : {}),
+          ...(authMetadata ? authMetadata : {}),
+        },
+        ...(versionUpgradeMessage ? { message: versionUpgradeMessage } : {}),
+        usageLimits: finalUsageLimits,
       },
-      ...(versionUpgradeMessage ? { message: versionUpgradeMessage } : {}),
-      usageLimits: resetCredits ? { ...usageLimits, resetCredits } : usageLimits,
-    },
-  });
+    }),
+    usageRead: makeUsageRead({
+      attemptedAt,
+      source: "probe",
+      usageLimits: finalUsageLimits,
+    }),
+  };
 });
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);

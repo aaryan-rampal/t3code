@@ -1015,6 +1015,7 @@ describe("makeManagedServerProvider", () => {
           attemptedAt: "2026-04-10T00:00:02.000Z",
           source: "notification",
           outcome: "success",
+          windowIds: ["seven_day"],
         });
         yield* provider.applyUsageLimits({
           checkedAt: "2026-04-10T00:00:03.000Z",
@@ -1234,6 +1235,7 @@ describe("makeManagedServerProvider", () => {
           attemptedAt: "2026-04-10T00:00:05.000Z",
           source: "notification",
           outcome: "success",
+          windowIds: ["session"],
         });
       }),
     ).pipe(Effect.provide(layerAlwaysRunTest)),
@@ -1368,7 +1370,66 @@ describe("makeManagedServerProvider", () => {
           attemptedAt: "2026-04-10T00:00:05.000Z",
           source: "notification",
           outcome: "success",
+          windowIds: ["session"],
         });
+      }),
+    ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
+  it.effect("records windowIds on partial notifications and omits them on complete updates", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const provider = yield* makeManagedServerProvider<TestSettings>({
+          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+          getSettings: Effect.succeed({ enabled: true }),
+          streamSettings: Stream.empty,
+          haveSettingsChanged: (previous, next) => previous.enabled !== next.enabled,
+          initialSnapshot: () => Effect.succeed(initialSnapshot),
+          checkProvider: Effect.succeed({
+            ...refreshedSnapshot,
+            usageLimits: {
+              checkedAt: "2026-04-10T00:00:01.000Z",
+              windows: [
+                { id: "five_hour", kind: "session", label: "Session", usedPercent: 10 },
+                { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 20 },
+              ],
+            },
+          }),
+          refreshOnInterval: false,
+        });
+        yield* Stream.take(provider.streamChanges, 1).pipe(Stream.runDrain);
+
+        yield* provider.applyUsageLimits({
+          checkedAt: "2026-04-10T00:01:00.000Z",
+          windows: [{ id: "five_hour", kind: "session", label: "Session", usedPercent: 25 }],
+        });
+        const partial = yield* provider.getSnapshot;
+        assert.deepStrictEqual(
+          partial.usageLimits?.windows.map((window) => window.id),
+          ["five_hour", "seven_day"],
+        );
+        assert.deepStrictEqual(partial.usageRead, {
+          attemptedAt: "2026-04-10T00:01:00.000Z",
+          source: "notification",
+          outcome: "success",
+          windowIds: ["five_hour"],
+        });
+
+        yield* provider.applyUsageLimits({
+          checkedAt: "2026-04-10T00:02:00.000Z",
+          complete: true,
+          windows: [
+            { id: "five_hour", kind: "session", label: "Session", usedPercent: 30 },
+            { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 22 },
+          ],
+        });
+        const complete = yield* provider.getSnapshot;
+        assert.deepStrictEqual(complete.usageRead, {
+          attemptedAt: "2026-04-10T00:02:00.000Z",
+          source: "notification",
+          outcome: "success",
+        });
+        assert.isUndefined(complete.usageRead?.windowIds);
       }),
     ).pipe(Effect.provide(layerAlwaysRunTest)),
   );

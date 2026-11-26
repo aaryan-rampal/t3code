@@ -36,8 +36,9 @@ function read(
   attemptedAt: string,
   outcome: "success" | "failed" | "unsupported" = "success",
   source: "probe" | "notification" = "probe",
+  windowIds?: ReadonlyArray<string>,
 ): ServerProviderUsageRead {
-  return { attemptedAt, source, outcome };
+  return { attemptedAt, source, outcome, ...(windowIds === undefined ? {} : { windowIds }) };
 }
 
 function snapshot(
@@ -493,6 +494,376 @@ describe("advanceQuotaHistory", () => {
     assert.isFalse(second.next?.hasReading);
     assert.strictEqual(second.next?.accountKey, "second-account");
   });
+
+  it("records claudeAgent windows, resetCredits, zeroSpendCap, notifications, cached reads and gaps", () => {
+    const claudeBaseline = advanceQuotaHistory({
+      previous: undefined,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        checkedAt: "2026-11-25T10:00:00.000Z",
+        auth: { workspaceId: "org-claude-1", email: "user@example.test" },
+        usageRead: read("2026-11-25T09:59:55.000Z"),
+        usageLimits: {
+          checkedAt: "2026-11-25T09:59:55.000Z",
+          windows: [
+            {
+              id: "five_hour",
+              kind: "session",
+              label: "Session",
+              usedPercent: 18,
+              resetsAt: "2026-11-25T14:00:00.000Z",
+              windowDurationMins: 300,
+            },
+            {
+              id: "seven_day",
+              kind: "weekly",
+              label: "Weekly",
+              usedPercent: 32,
+              resetsAt: "2026-11-30T00:00:00.000Z",
+              windowDurationMins: 10080,
+            },
+            {
+              id: "seven_day_fable",
+              kind: "weekly",
+              label: "Weekly · Fable",
+              usedPercent: 55,
+              resetsAt: "2026-11-30T00:00:00.000Z",
+              windowDurationMins: 10080,
+            },
+            {
+              id: "monthly_spend",
+              kind: "monthly",
+              label: "Monthly spend",
+              usedPercent: 12.5,
+            },
+          ],
+          resetCredits: {
+            availableCount: 2,
+            nextExpiresAt: "2026-12-01T00:00:00.000Z",
+            nextCreditId: "grant-1",
+          },
+          zeroSpendCap: true,
+        },
+      }),
+      observedAt,
+    });
+
+    assert.strictEqual(claudeBaseline.records.length, 1);
+    assert.deepStrictEqual(claudeBaseline.records[0], {
+      version: 1,
+      kind: "reading",
+      observedAt,
+      providerInstanceId: "claudeAgent",
+      driver: "claudeAgent",
+      accountKey: "org-claude-1",
+      source: "probe",
+      checkedAt: "2026-11-25T09:59:55.000Z",
+      windows: [
+        {
+          id: "five_hour",
+          kind: "session",
+          label: "Session",
+          usedPercent: 18,
+          resetsAt: "2026-11-25T14:00:00.000Z",
+          windowDurationMins: 300,
+          meter: "upstream",
+        },
+        {
+          id: "seven_day",
+          kind: "weekly",
+          label: "Weekly",
+          usedPercent: 32,
+          resetsAt: "2026-11-30T00:00:00.000Z",
+          windowDurationMins: 10080,
+          meter: "upstream",
+        },
+        {
+          id: "seven_day_fable",
+          kind: "weekly",
+          label: "Weekly · Fable",
+          usedPercent: 55,
+          resetsAt: "2026-11-30T00:00:00.000Z",
+          windowDurationMins: 10080,
+          meter: "upstream",
+        },
+        {
+          id: "monthly_spend",
+          kind: "monthly",
+          label: "Monthly spend",
+          usedPercent: 12.5,
+          meter: "upstream",
+        },
+      ],
+      resetCredits: {
+        availableCount: 2,
+        nextExpiresAt: "2026-12-01T00:00:00.000Z",
+      },
+      zeroSpendCap: true,
+    });
+
+    // Cached usageCheckedAt republished with a new probe timestamp is ignored.
+    const cachedRepublish = advanceQuotaHistory({
+      previous: claudeBaseline.next,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        checkedAt: "2026-11-25T10:02:00.000Z",
+        auth: { workspaceId: "org-claude-1" },
+        usageRead: read("2026-11-25T10:02:00.000Z"),
+        usageLimits: {
+          checkedAt: "2026-11-25T09:59:55.000Z",
+          windows: [
+            {
+              id: "five_hour",
+              kind: "session",
+              label: "Session",
+              usedPercent: 18,
+            },
+          ],
+        },
+      }),
+      observedAt: "2026-11-25T10:02:01.000Z",
+    });
+    assert.deepStrictEqual(cachedRepublish.records, []);
+    assert.strictEqual(cachedRepublish.next?.lastReadAt, "2026-11-25T10:02:00.000Z");
+
+    // A streamed notification updates the history with source: "notification".
+    const notified = advanceQuotaHistory({
+      previous: cachedRepublish.next,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        checkedAt: "2026-11-25T10:03:00.000Z",
+        auth: { workspaceId: "org-claude-1" },
+        usageRead: read("2026-11-25T10:03:00.000Z", "success", "notification"),
+        usageLimits: {
+          checkedAt: "2026-11-25T10:03:00.000Z",
+          windows: [
+            {
+              id: "five_hour",
+              kind: "session",
+              label: "Session",
+              usedPercent: 24,
+            },
+          ],
+        },
+      }),
+      observedAt: "2026-11-25T10:03:01.000Z",
+    });
+    assert.strictEqual(notified.records[0]?.kind, "reading");
+    assert.strictEqual(
+      notified.records[0]?.kind === "reading" && notified.records[0].source,
+      "notification",
+    );
+
+    // probeFailed and unsupported transitions emit gaps after a baseline.
+    const failedGap = advanceQuotaHistory({
+      previous: notified.next,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        checkedAt: "2026-11-25T10:08:00.000Z",
+        auth: { workspaceId: "org-claude-1" },
+        usageRead: read("2026-11-25T10:08:00.000Z", "failed"),
+        usageLimits: {
+          checkedAt: "2026-11-25T10:08:00.000Z",
+          windows: [],
+          unavailable: { reason: "probeFailed" },
+        },
+      }),
+      observedAt: "2026-11-25T10:08:01.000Z",
+    });
+    assert.deepStrictEqual(failedGap.records, [
+      {
+        version: 1,
+        kind: "gap",
+        observedAt: "2026-11-25T10:08:01.000Z",
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        accountKey: "org-claude-1",
+        source: "probe",
+        reason: "probeFailed",
+      },
+    ]);
+
+    const unsupportedGap = advanceQuotaHistory({
+      previous: failedGap.next,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        checkedAt: "2026-11-25T10:10:00.000Z",
+        auth: { workspaceId: "org-claude-1" },
+        usageRead: read("2026-11-25T10:10:00.000Z", "unsupported"),
+        usageLimits: {
+          checkedAt: "2026-11-25T10:10:00.000Z",
+          windows: [],
+          unavailable: { reason: "unsupported" },
+        },
+      }),
+      observedAt: "2026-11-25T10:10:01.000Z",
+    });
+    assert.strictEqual(unsupportedGap.records[0]?.kind, "gap");
+    assert.strictEqual(
+      unsupportedGap.records[0]?.kind === "gap" && unsupportedGap.records[0].reason,
+      "unsupported",
+    );
+  });
+
+  it("filters notification readings to usageRead.windowIds and emits nothing when none match", () => {
+    const first = advanceQuotaHistory({
+      previous: undefined,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        auth: { workspaceId: "org-claude-1" },
+        usageRead: read("2026-11-25T10:00:00.000Z"),
+        usageLimits: {
+          checkedAt: "2026-11-25T10:00:00.000Z",
+          windows: [
+            { id: "five_hour", kind: "session", label: "Session", usedPercent: 10 },
+            { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 20 },
+          ],
+        },
+      }),
+      observedAt,
+    });
+
+    // Partial five_hour notification retains seven_day in usageLimits, but only five_hour is recorded.
+    const notified = advanceQuotaHistory({
+      previous: first.next,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        auth: { workspaceId: "org-claude-1" },
+        usageRead: read("2026-11-25T10:02:00.000Z", "success", "notification", ["five_hour"]),
+        usageLimits: {
+          checkedAt: "2026-11-25T10:02:00.000Z",
+          windows: [
+            { id: "five_hour", kind: "session", label: "Session", usedPercent: 25 },
+            { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 20 },
+          ],
+        },
+      }),
+      observedAt: "2026-11-25T10:02:01.000Z",
+    });
+    assert.strictEqual(notified.records.length, 1);
+    const notifiedRecord = notified.records[0];
+    assert.strictEqual(notifiedRecord?.kind, "reading");
+    if (notifiedRecord?.kind === "reading") {
+      assert.deepStrictEqual(
+        notifiedRecord.windows.map((window) => [window.id, window.usedPercent]),
+        [["five_hour", 25]],
+      );
+    }
+
+    // If none of windowIds match the snapshot windows, emit no reading.
+    const unmatched = advanceQuotaHistory({
+      previous: notified.next,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        auth: { workspaceId: "org-claude-1" },
+        usageRead: read("2026-11-25T10:03:00.000Z", "success", "notification", ["nonexistent"]),
+        usageLimits: {
+          checkedAt: "2026-11-25T10:03:00.000Z",
+          windows: [{ id: "five_hour", kind: "session", label: "Session", usedPercent: 25 }],
+        },
+      }),
+      observedAt: "2026-11-25T10:03:01.000Z",
+    });
+    assert.deepStrictEqual(unmatched.records, []);
+    assert.strictEqual(unmatched.next?.lastReadAt, "2026-11-25T10:03:00.000Z");
+  });
+
+  it("records distinct partial notifications arriving in the same millisecond without duplicating republishes", () => {
+    const first = advanceQuotaHistory({
+      previous: undefined,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        auth: { workspaceId: "org-claude-1" },
+        usageRead: read("2026-11-25T10:00:00.000Z"),
+        usageLimits: {
+          checkedAt: "2026-11-25T10:00:00.000Z",
+          windows: [
+            { id: "five_hour", kind: "session", label: "Session", usedPercent: 10 },
+            { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 20 },
+          ],
+        },
+      }),
+      observedAt,
+    });
+
+    const fiveHour = advanceQuotaHistory({
+      previous: first.next,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        auth: { workspaceId: "org-claude-1" },
+        usageRead: read("2026-11-25T10:02:00.000Z", "success", "notification", ["five_hour"]),
+        usageLimits: {
+          checkedAt: "2026-11-25T10:02:00.000Z",
+          windows: [
+            { id: "five_hour", kind: "session", label: "Session", usedPercent: 25 },
+            { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 20 },
+          ],
+        },
+      }),
+      observedAt: "2026-11-25T10:02:00.100Z",
+    });
+    assert.strictEqual(fiveHour.records.length, 1);
+
+    // Same millisecond, distinct window: seven_day must still be recorded.
+    const sevenDay = advanceQuotaHistory({
+      previous: fiveHour.next,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        auth: { workspaceId: "org-claude-1" },
+        usageRead: read("2026-11-25T10:02:00.000Z", "success", "notification", ["seven_day"]),
+        usageLimits: {
+          checkedAt: "2026-11-25T10:02:00.000Z",
+          windows: [
+            { id: "five_hour", kind: "session", label: "Session", usedPercent: 25 },
+            { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 22 },
+          ],
+        },
+      }),
+      observedAt: "2026-11-25T10:02:00.200Z",
+    });
+    assert.strictEqual(sevenDay.records.length, 1);
+    const sevenDayRecord = sevenDay.records[0];
+    assert.strictEqual(sevenDayRecord?.kind, "reading");
+    if (sevenDayRecord?.kind === "reading") {
+      assert.deepStrictEqual(
+        sevenDayRecord.windows.map((window) => [window.id, window.usedPercent]),
+        [["seven_day", 22]],
+      );
+    }
+    // Partial notifications preserve the last full read timestamp.
+    assert.strictEqual(sevenDay.next?.lastFullReadAt, "2026-11-25T10:00:00.000Z");
+
+    // Republishing either window at the same millisecond is ignored.
+    const duplicate = advanceQuotaHistory({
+      previous: sevenDay.next,
+      snapshot: snapshot({
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        auth: { workspaceId: "org-claude-1" },
+        usageRead: read("2026-11-25T10:02:00.000Z", "success", "notification", ["seven_day"]),
+        usageLimits: {
+          checkedAt: "2026-11-25T10:02:00.000Z",
+          windows: [
+            { id: "five_hour", kind: "session", label: "Session", usedPercent: 25 },
+            { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 22 },
+          ],
+        },
+      }),
+      observedAt: "2026-11-25T10:02:00.300Z",
+    });
+    assert.deepStrictEqual(duplicate.records, []);
+  });
 });
 
 describe("quotaHistoryFilePath", () => {
@@ -507,6 +878,36 @@ describe("quotaHistoryFilePath", () => {
 describe("quotaHistorySampleIds", () => {
   const now = Date.parse("2026-11-25T10:05:00.000Z");
   const intervalMs = 5 * 60_000;
+
+  it("does not let a recent partial notification postpone a due full probe", () => {
+    const partialClaude = provider({
+      instanceId: "claudeAgent",
+      driver: "claudeAgent",
+      checkedAt: "2026-11-25T10:04:00.000Z",
+      usageLimits: limits("2026-11-25T10:04:00.000Z", []),
+      usageRead: read("2026-11-25T10:04:00.000Z", "success", "notification", ["five_hour"]),
+    });
+    // Last full read was at 10:00 (5 min ago), so the 10:04 partial notification must not skip it.
+    assert.deepStrictEqual(
+      quotaHistorySampleIds(
+        [partialClaude],
+        now,
+        intervalMs,
+        new Map([["claudeAgent", "2026-11-25T10:00:00.000Z"]]),
+      ),
+      [ProviderInstanceId.make("claudeAgent")],
+    );
+    // When the last full read is still fresh (10:02), it stays skipped.
+    assert.deepStrictEqual(
+      quotaHistorySampleIds(
+        [partialClaude],
+        now,
+        intervalMs,
+        new Map([["claudeAgent", "2026-11-25T10:02:00.000Z"]]),
+      ),
+      [],
+    );
+  });
 
   it("selects only observed providers whose last usage read is due", () => {
     const due = quotaHistorySampleIds(
@@ -549,6 +950,31 @@ describe("quotaHistorySampleIds", () => {
           usageRead: read("2026-11-25T10:00:00.000Z"),
         }),
         provider({
+          instanceId: "claudeAgent",
+          driver: "claudeAgent",
+          checkedAt: "2026-11-25T10:00:00.000Z",
+          usageLimits: limits("2026-11-25T10:00:00.000Z", []),
+          usageRead: read("2026-11-25T10:00:00.000Z"),
+        }),
+        provider({
+          instanceId: "claudeAgent-fresh",
+          driver: "claudeAgent",
+          checkedAt: "2026-11-25T10:02:00.000Z",
+          usageLimits: limits("2026-11-25T10:02:00.000Z", []),
+          usageRead: read("2026-11-25T10:02:00.000Z"),
+        }),
+        provider({
+          instanceId: "claudeAgent-unsupported",
+          driver: "claudeAgent",
+          checkedAt: "2026-11-25T10:00:00.000Z",
+          usageLimits: {
+            checkedAt: "2026-11-25T10:00:00.000Z",
+            windows: [],
+            unavailable: { reason: "unsupported" },
+          },
+          usageRead: read("2026-11-25T10:00:00.000Z", "unsupported"),
+        }),
+        provider({
           instanceId: "unsupported",
           driver: "codex",
           checkedAt: "2026-11-25T10:00:00.000Z",
@@ -567,6 +993,7 @@ describe("quotaHistorySampleIds", () => {
     assert.deepStrictEqual(due, [
       ProviderInstanceId.make("codex"),
       ProviderInstanceId.make("opencode"),
+      ProviderInstanceId.make("claudeAgent"),
     ]);
   });
 

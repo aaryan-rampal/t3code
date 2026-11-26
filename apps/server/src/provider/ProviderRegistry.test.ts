@@ -6,8 +6,8 @@ import * as CodexManagedTokenBroker from "./CodexManagedTokenBroker.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import { describe, it, assert, expect } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -36,7 +36,6 @@ import {
   ServerSettings,
   ServerSettingsError,
   ServerProvider,
-  type ServerProviderSlashCommand,
   type ServerProviderUpdateState,
   type ServerProviderVersionAdvisoryStatus,
   type ServerSettings as ContractServerSettings,
@@ -55,7 +54,7 @@ import {
   type CodexAppServerProviderSnapshot,
 } from "./CodexProvider.ts";
 import { BUNDLED_CLAUDE_MODEL_CATALOG } from "./ClaudeModelCatalog.ts";
-import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
+import { type ClaudeCapabilitiesProbe, checkClaudeProviderStatus } from "./ClaudeProvider.ts";
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
 import * as AntigravityInstallation from "./AntigravityInstallation.ts";
 import * as ModelManifest from "./ModelManifest.ts";
@@ -320,15 +319,7 @@ function booleanDescriptor(id: string, label: string) {
   };
 }
 
-type TestClaudeCapabilities = {
-  readonly email: string | undefined;
-  readonly subscriptionType: string | undefined;
-  readonly tokenSource: string | undefined;
-  readonly apiKeySource: string | undefined;
-  readonly apiProvider: string | undefined;
-  readonly slashCommands: ReadonlyArray<ServerProviderSlashCommand>;
-  readonly models?: ReadonlyArray<ModelInfo>;
-};
+type TestClaudeCapabilities = ClaudeCapabilitiesProbe;
 
 function claudeCapabilities(overrides: Partial<TestClaudeCapabilities> = {}) {
   return () =>
@@ -4838,6 +4829,8 @@ it.layer(
         );
         assert.strictEqual(status.status, "error");
         assert.strictEqual(status.auth.status, "unauthenticated");
+        assert.isUndefined(status.usageLimits);
+        assert.isUndefined(status.usageRead);
       }).pipe(
         Effect.provide(
           layerMockSpawner((args) => {
@@ -4882,6 +4875,8 @@ it.layer(
             environment,
           );
           assert.strictEqual(status.auth.status, "unauthenticated");
+          assert.isUndefined(status.usageLimits);
+          assert.isUndefined(status.usageRead);
           if (configDir === undefined) {
             assert.strictEqual(
               status.message,
@@ -4929,6 +4924,8 @@ it.layer(
           },
         );
         assert.strictEqual(status.auth.status, "unauthenticated");
+        assert.isUndefined(status.usageLimits);
+        assert.isUndefined(status.usageRead);
         assert.deepStrictEqual(status.updateRequiredModels, [
           { slug: "claude-next", name: "Next", minVersion: "1.1.0" },
         ]);
@@ -4970,6 +4967,11 @@ it.layer(
         assert.strictEqual(status.auth.status, "authenticated");
         assert.strictEqual(status.auth.type, "customEndpoint");
         assert.strictEqual(status.auth.label, "Custom API endpoint");
+        assert.deepStrictEqual(status.usageRead, {
+          attemptedAt: status.checkedAt,
+          source: "probe",
+          outcome: "failed",
+        });
       }).pipe(
         Effect.provide(
           layerMockSpawner((args) => {
@@ -5032,6 +5034,11 @@ it.layer(
           assert.strictEqual(status.status, "ready");
           assert.strictEqual(status.auth.type, type);
           assert.strictEqual(status.auth.label, label);
+          assert.deepStrictEqual(status.usageRead, {
+            attemptedAt: status.checkedAt,
+            source: "probe",
+            outcome: "failed",
+          });
         }).pipe(
           Effect.provide(
             layerMockSpawner((args) => {
@@ -5067,6 +5074,8 @@ it.layer(
         );
         assert.strictEqual(status.status, "error");
         assert.strictEqual(status.auth.status, "unauthenticated");
+        assert.isUndefined(status.usageLimits);
+        assert.isUndefined(status.usageRead);
         assert.strictEqual(status.auth.type, undefined);
       }).pipe(
         Effect.provide(
@@ -5157,6 +5166,161 @@ it.layer(
           ),
           ["effort:high|xhigh", "ultracode:boolean"],
         );
+      }).pipe(
+        Effect.provide(
+          layerMockSpawner((args) => {
+            const joined = args.join(" ");
+            if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
+            throw new Error(`Unexpected args: ${joined}`);
+          }),
+        ),
+      ),
+    );
+
+    it.effect("sets usageRead with usageCheckedAt when the capabilities probe returns usage", () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-25T10:05:00.000Z"));
+        const usageCheckedAt = "2026-11-25T10:01:00.000Z";
+        const status = yield* checkClaudeProviderStatus(
+          defaultClaudeSettings,
+          claudeCapabilities({
+            workspaceId: "org-123",
+            usageCheckedAt,
+            usage: {
+              rate_limits_available: true,
+              rate_limits: {
+                five_hour: { utilization: 25, resets_at: "2026-11-25T14:00:00.000Z" },
+                seven_day: { utilization: 12, resets_at: "2026-11-30T00:00:00.000Z" },
+              },
+            },
+          }),
+        );
+
+        assert.strictEqual(status.checkedAt, "2026-11-25T10:05:00.000Z");
+        assert.strictEqual(status.usageLimits?.checkedAt, usageCheckedAt);
+        assert.deepStrictEqual(status.usageRead, {
+          attemptedAt: usageCheckedAt,
+          source: "probe",
+          outcome: "success",
+        });
+      }).pipe(
+        Effect.provide(
+          layerMockSpawner((args) => {
+            const joined = args.join(" ");
+            if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
+            throw new Error(`Unexpected args: ${joined}`);
+          }),
+        ),
+      ),
+    );
+
+    it.effect("sets usageRead outcome to unsupported when rate limits are unavailable", () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-25T10:05:00.000Z"));
+        const usageCheckedAt = "2026-11-25T10:02:00.000Z";
+        const status = yield* checkClaudeProviderStatus(
+          defaultClaudeSettings,
+          claudeCapabilities({
+            usageCheckedAt,
+            usage: {
+              rate_limits_available: false,
+              rate_limits: null,
+            },
+          }),
+        );
+
+        assert.deepStrictEqual(status.usageLimits, {
+          checkedAt: usageCheckedAt,
+          windows: [],
+          unavailable: { reason: "unsupported" },
+        });
+        assert.deepStrictEqual(status.usageRead, {
+          attemptedAt: usageCheckedAt,
+          source: "probe",
+          outcome: "unsupported",
+        });
+      }).pipe(
+        Effect.provide(
+          layerMockSpawner((args) => {
+            const joined = args.join(" ");
+            if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
+            throw new Error(`Unexpected args: ${joined}`);
+          }),
+        ),
+      ),
+    );
+
+    it.effect("sets usageRead outcome to failed when capabilities.usage is missing", () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-25T10:05:00.000Z"));
+        const status = yield* checkClaudeProviderStatus(
+          defaultClaudeSettings,
+          claudeCapabilities({ usageCheckedAt: "2026-11-25T10:00:00.000Z" }),
+        );
+
+        assert.deepStrictEqual(status.usageLimits, {
+          checkedAt: "2026-11-25T10:05:00.000Z",
+          windows: [],
+          unavailable: { reason: "probeFailed" },
+        });
+        assert.deepStrictEqual(status.usageRead, {
+          attemptedAt: "2026-11-25T10:05:00.000Z",
+          source: "probe",
+          outcome: "failed",
+        });
+      }).pipe(
+        Effect.provide(
+          layerMockSpawner((args) => {
+            const joined = args.join(" ");
+            if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
+            throw new Error(`Unexpected args: ${joined}`);
+          }),
+        ),
+      ),
+    );
+
+    it.effect("sets usageRead and probeFailed when the capabilities probe fails or times out", () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-25T10:05:00.000Z"));
+        const failed = yield* checkClaudeProviderStatus(defaultClaudeSettings, () =>
+          Effect.fail({
+            _tag: "ClaudeCapabilitiesProbeSdkError",
+            operation: "initialize",
+            cause: new Error("boom"),
+            message: "boom",
+          } as never),
+        );
+        assert.strictEqual(failed.status, "warning");
+        assert.deepStrictEqual(failed.usageLimits, {
+          checkedAt: "2026-11-25T10:05:00.000Z",
+          windows: [],
+          unavailable: { reason: "probeFailed" },
+        });
+        assert.deepStrictEqual(failed.usageRead, {
+          attemptedAt: "2026-11-25T10:05:00.000Z",
+          source: "probe",
+          outcome: "failed",
+        });
+
+        const timedOut = yield* checkClaudeProviderStatus(defaultClaudeSettings, () =>
+          Effect.fail(new Cause.TimeoutError()),
+        );
+        assert.strictEqual(timedOut.status, "warning");
+        assert.include(timedOut.message ?? "", "Timed out");
+        assert.deepStrictEqual(timedOut.usageLimits, {
+          checkedAt: "2026-11-25T10:05:00.000Z",
+          windows: [],
+          unavailable: { reason: "probeFailed" },
+        });
+        assert.deepStrictEqual(timedOut.usageRead, {
+          attemptedAt: "2026-11-25T10:05:00.000Z",
+          source: "probe",
+          outcome: "failed",
+        });
+
+        const withoutProbe = yield* checkClaudeProviderStatus(defaultClaudeSettings);
+        assert.isUndefined(withoutProbe.usageLimits);
+        assert.isUndefined(withoutProbe.usageRead);
       }).pipe(
         Effect.provide(
           layerMockSpawner((args) => {

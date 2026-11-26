@@ -46,11 +46,13 @@ export function makeUsageRead(input: {
   readonly attemptedAt: string;
   readonly source: ServerProviderUsageRead["source"];
   readonly usageLimits: ServerProviderUsageLimits | undefined;
+  readonly windowIds?: ReadonlyArray<string>;
 }): ServerProviderUsageRead {
   return {
     attemptedAt: input.attemptedAt,
     source: input.source,
     outcome: usageReadOutcome(input.usageLimits),
+    ...(input.windowIds === undefined ? {} : { windowIds: input.windowIds }),
   };
 }
 

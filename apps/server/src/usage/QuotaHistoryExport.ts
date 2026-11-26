@@ -1,6 +1,7 @@
 import type { ServerProviderUsageWindow, UsageProviderKind } from "@t3tools/contracts";
 import type { UsageRecord } from "@t3tools/provider-core/server/usage";
 
+import { windowLimitsModel } from "../provider/claudeUsageLimits.ts";
 import type {
   QuotaHistoryGap,
   QuotaHistoryMeter,
@@ -55,6 +56,7 @@ export interface QuotaHistoryObservation {
   readonly windowDurationMins?: number;
   readonly spent?: number;
   readonly limit?: number;
+  readonly zeroSpendCap?: true;
   /** The coverage the provider reported for this bucket at this observation. */
   readonly modelIds?: ReadonlyArray<string>;
   readonly providerIds?: ReadonlyArray<string>;
@@ -136,6 +138,7 @@ export interface QuotaHistoryExport {
 
 const TOKEN_PROVIDERS: ReadonlyMap<string, UsageProviderKind> = new Map([
   ["antigravity", "antigravity"],
+  ["claudeAgent", "claude"],
   ["codex", "codex"],
   ["opencode", "opencode"],
 ]);
@@ -298,14 +301,16 @@ function tokenProviderId(record: UsageRecord): string | undefined {
 }
 
 /**
- * OpenCode buckets describe Go, Console budgets or direct upstream usage, so a
- * bucket only owns the tokens its meter and coverage identify.
+ * Claude model-scoped weekly buckets cover only matching models, and OpenCode
+ * buckets describe Go, Console budgets or direct upstream usage, so each bucket
+ * only owns the tokens its meter and coverage identify.
  */
 function tokenMatchesWindow(
   record: UsageRecord,
   driver: string,
   window: QuotaHistoryReading["windows"][number],
 ): boolean {
+  if (driver === "claudeAgent") return windowLimitsModel(window, record.model);
   if (driver !== "opencode") return true;
   const providerId = tokenProviderId(record);
   if (window.meter === "opencode_go") return providerId === "opencode-go";
@@ -327,6 +332,8 @@ function tokenScopeUncertain(
   driver: string,
   window: QuotaHistoryReading["windows"][number],
 ): boolean {
+  // Claude transcripts do not report whether tokens were billed to included quota or extra monthly spend.
+  if (driver === "claudeAgent" && window.id === "monthly_spend") return true;
   if (driver !== "opencode" || window.meter !== "opencode_console") return false;
   return (window.modelIds ?? []).length === 0 && (window.providerIds ?? []).length === 0;
 }
@@ -435,6 +442,7 @@ function observationOf(
       : { windowDurationMins: window.windowDurationMins }),
     ...(window.spent === undefined ? {} : { spent: window.spent }),
     ...(window.limit === undefined ? {} : { limit: window.limit }),
+    ...(reading.zeroSpendCap ? { zeroSpendCap: true } : {}),
     ...(window.modelIds === undefined ? {} : { modelIds: window.modelIds }),
     ...(window.providerIds === undefined ? {} : { providerIds: window.providerIds }),
   };
@@ -463,8 +471,18 @@ function resetCrossed(input: {
   if (fromReset !== undefined && toReset !== undefined && toReset - fromReset > RESET_JITTER_MS) {
     return true;
   }
-  const creditsBefore = input.previous.resetCredits?.availableCount ?? 0;
-  const creditsAfter = input.reading.resetCredits?.availableCount ?? 0;
+  const creditsBefore = input.previous.resetCredits?.availableCount;
+  const creditsAfter = input.reading.resetCredits?.availableCount;
+  if (creditsBefore === undefined || creditsAfter === undefined) return false;
+  // Once the next grant expires, a drop in available count can reflect expiry rather than redemption.
+  const previousNextExpiresAt = timestamp(input.previous.resetCredits?.nextExpiresAt);
+  if (
+    previousNextExpiresAt !== undefined &&
+    toCheckedAt !== undefined &&
+    toCheckedAt >= previousNextExpiresAt
+  ) {
+    return false;
+  }
   return creditsAfter < creditsBefore && input.to.usedPercent < input.from.usedPercent;
 }
 

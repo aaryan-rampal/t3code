@@ -7,6 +7,7 @@ import {
   type QuotaHistoryTokenTotals,
 } from "./QuotaHistoryExport.ts";
 import {
+  advanceQuotaHistory,
   quotaHistoryMeter,
   type QuotaHistoryGap,
   type QuotaHistoryReading,
@@ -53,7 +54,9 @@ function reading(input: {
   readonly driver?: string;
   readonly providerInstanceId?: string;
   readonly accountKey?: string;
+  readonly source?: QuotaHistoryReading["source"];
   readonly resetCredits?: QuotaHistoryReading["resetCredits"];
+  readonly zeroSpendCap?: true;
   readonly windows: ReadonlyArray<WindowInput>;
 }): QuotaHistoryReading {
   const driver = input.driver ?? "codex";
@@ -64,9 +67,10 @@ function reading(input: {
     providerInstanceId: input.providerInstanceId ?? driver,
     driver,
     ...(input.accountKey === undefined ? {} : { accountKey: input.accountKey }),
-    source: "probe",
+    source: input.source ?? "probe",
     checkedAt: input.checkedAt ?? input.observedAt,
     ...(input.resetCredits === undefined ? {} : { resetCredits: input.resetCredits }),
+    ...(input.zeroSpendCap ? { zeroSpendCap: true } : {}),
     windows: input.windows.map((entry) => window(driver, entry)),
   };
 }
@@ -782,5 +786,351 @@ describe("exportQuotaHistory", () => {
     });
 
     assert.strictEqual(JSON.stringify(reversed), JSON.stringify(forward));
+  });
+
+  it("joins claudeAgent readings with claude tokens, scopes seven_day_* models, dedupes content blocks and detects resetCredits crossings", () => {
+    const exported = exportQuotaHistory({
+      records: [
+        reading({
+          observedAt: at(10, 0),
+          driver: "claudeAgent",
+          providerInstanceId: "claudeAgent",
+          accountKey: "org-claude",
+          resetCredits: { availableCount: 2 },
+          windows: [
+            {
+              id: "five_hour",
+              kind: "session",
+              label: "Session",
+              usedPercent: 80,
+              resetsAt: at(14, 0),
+            },
+            {
+              id: "seven_day",
+              kind: "weekly",
+              label: "Weekly",
+              usedPercent: 20,
+              resetsAt: "2026-11-30T00:00:00.000Z",
+            },
+            {
+              id: "seven_day_fable",
+              kind: "weekly",
+              label: "Weekly · Fable",
+              usedPercent: 10,
+              resetsAt: "2026-11-30T00:00:00.000Z",
+            },
+            { id: "monthly_spend", kind: "monthly", label: "Monthly spend", usedPercent: 40 },
+          ],
+        }),
+        reading({
+          observedAt: at(10, 5),
+          driver: "claudeAgent",
+          providerInstanceId: "claudeAgent",
+          accountKey: "org-claude",
+          resetCredits: { availableCount: 1 },
+          windows: [
+            {
+              id: "five_hour",
+              kind: "session",
+              label: "Session",
+              usedPercent: 5,
+              resetsAt: at(14, 0),
+            },
+            {
+              id: "seven_day",
+              kind: "weekly",
+              label: "Weekly",
+              usedPercent: 24,
+              resetsAt: "2026-11-30T00:00:00.000Z",
+            },
+            {
+              id: "seven_day_fable",
+              kind: "weekly",
+              label: "Weekly · Fable",
+              usedPercent: 15,
+              resetsAt: "2026-11-30T00:00:00.000Z",
+            },
+            { id: "monthly_spend", kind: "monthly", label: "Monthly spend", usedPercent: 42 },
+          ],
+        }),
+      ],
+      tokens: [
+        // Repeated assistant content-block records share dedupeKey and merge by max-per-channel.
+        token({
+          at: at(10, 1),
+          provider: "claude",
+          model: "claude-opus-5-5",
+          sessionId: "claude-session-1",
+          dedupeKey: "msg_1:req_1",
+          totals: {
+            uncachedInputTokens: 10,
+            cachedInputTokens: 100,
+            cacheCreationTokens: 500,
+            outputTokens: 20,
+          },
+        }),
+        token({
+          at: at(10, 1),
+          provider: "claude",
+          model: "claude-opus-5-5",
+          sessionId: "claude-session-1",
+          dedupeKey: "msg_1:req_1",
+          totals: {
+            uncachedInputTokens: 10,
+            cachedInputTokens: 150,
+            cacheCreationTokens: 400,
+            outputTokens: 60,
+          },
+        }),
+        // Separate advisor iteration record keeps its own dedupeKey and model.
+        token({
+          at: at(10, 1),
+          provider: "claude",
+          model: "claude-fable-5-1",
+          sessionId: "claude-session-1",
+          dedupeKey: "msg_1:req_1:advisor:0",
+          totals: {
+            uncachedInputTokens: 300,
+            cachedInputTokens: 0,
+            cacheCreationTokens: 50,
+            outputTokens: 40,
+          },
+        }),
+      ],
+    });
+
+    assert.strictEqual(exported.tokenRecords, 2);
+    assert.strictEqual(exported.duplicateTokenRecords, 1);
+
+    const fiveHour = exported.buckets.find((bucket) => bucket.bucketId === "five_hour")!;
+    const sevenDay = exported.buckets.find((bucket) => bucket.bucketId === "seven_day")!;
+    const sevenDayFable = exported.buckets.find((bucket) => bucket.bucketId === "seven_day_fable")!;
+    const monthlySpend = exported.buckets.find((bucket) => bucket.bucketId === "monthly_spend")!;
+
+    // resetCredits decrement + lower usedPercent is treated as a reset crossing.
+    assert.strictEqual(fiveHour.intervals[0]?.reset, true);
+    assert.strictEqual(fiveHour.intervals[0]?.lowerReading, false);
+    assert.strictEqual(fiveHour.intervals[0]?.quotaDeltaPercent, null);
+
+    // Unscoped buckets include both executor and advisor models with max-per-channel dedupe.
+    for (const bucket of [fiveHour, sevenDay]) {
+      assert.strictEqual(bucket.tokenAttributionUncertain, false);
+      assert.strictEqual(bucket.intervals[0]?.tokenScopeUncertain, false);
+      assert.deepStrictEqual(bucket.intervals[0]?.tokenTotals, {
+        uncachedInputTokens: 310,
+        cachedInputTokens: 150,
+        cacheCreationTokens: 550,
+        outputTokens: 100,
+        reasoningTokens: 0,
+      });
+      assert.deepStrictEqual(
+        bucket.intervals[0]?.tokens.map((group) => [group.model, group.requests]),
+        [
+          ["claude-fable-5-1", 1],
+          ["claude-opus-5-5", 1],
+        ],
+      );
+    }
+
+    // monthly_spend cannot distinguish included quota vs extra spend in transcripts.
+    assert.strictEqual(monthlySpend.tokenAttributionUncertain, true);
+    assert.strictEqual(monthlySpend.intervals[0]?.tokenScopeUncertain, true);
+    assert.deepStrictEqual(monthlySpend.intervals[0]?.tokenTotals, {
+      uncachedInputTokens: 310,
+      cachedInputTokens: 150,
+      cacheCreationTokens: 550,
+      outputTokens: 100,
+      reasoningTokens: 0,
+    });
+
+    // Model-scoped seven_day_fable only includes matching Claude models.
+    assert.strictEqual(sevenDayFable.intervals[0]?.quotaDeltaPercent, 5);
+    assert.deepStrictEqual(
+      sevenDayFable.intervals[0]?.tokens.map((group) => [group.model, group.totals]),
+      [
+        [
+          "claude-fable-5-1",
+          {
+            uncachedInputTokens: 300,
+            cachedInputTokens: 0,
+            cacheCreationTokens: 50,
+            outputTokens: 40,
+            reasoningTokens: 0,
+          },
+        ],
+      ],
+    );
+  });
+
+  it("keeps weekly intervals clean across five_hour-only partial notifications", () => {
+    const t0 = at(10, 0);
+    const t1 = at(10, 2);
+    const t2 = at(10, 5);
+    const step1 = advanceQuotaHistory({
+      previous: undefined,
+      observedAt: t0,
+      snapshot: {
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        checkedAt: t0,
+        auth: { workspaceId: "org-claude" },
+        usageRead: { attemptedAt: t0, source: "probe", outcome: "success" },
+        usageLimits: {
+          checkedAt: t0,
+          windows: [
+            { id: "five_hour", kind: "session", label: "Session", usedPercent: 10 },
+            { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 20 },
+          ],
+        },
+      },
+    });
+    const step2 = advanceQuotaHistory({
+      previous: step1.next,
+      observedAt: t1,
+      snapshot: {
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        checkedAt: t1,
+        auth: { workspaceId: "org-claude" },
+        usageRead: {
+          attemptedAt: t1,
+          source: "notification",
+          outcome: "success",
+          windowIds: ["five_hour"],
+        },
+        usageLimits: {
+          checkedAt: t1,
+          windows: [
+            { id: "five_hour", kind: "session", label: "Session", usedPercent: 25 },
+            { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 20 },
+          ],
+        },
+      },
+    });
+    const step3 = advanceQuotaHistory({
+      previous: step2.next,
+      observedAt: t2,
+      snapshot: {
+        providerInstanceId: "claudeAgent",
+        driver: "claudeAgent",
+        checkedAt: t2,
+        auth: { workspaceId: "org-claude" },
+        usageRead: { attemptedAt: t2, source: "probe", outcome: "success" },
+        usageLimits: {
+          checkedAt: t2,
+          windows: [
+            { id: "five_hour", kind: "session", label: "Session", usedPercent: 30 },
+            { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 24 },
+          ],
+        },
+      },
+    });
+
+    const exported = exportQuotaHistory({
+      records: [...step1.records, ...step2.records, ...step3.records],
+      tokens: [
+        token({
+          at: at(10, 1),
+          provider: "claude",
+          model: "claude-opus-5-5",
+          dedupeKey: "k1",
+          totals: { uncachedInputTokens: 100 },
+        }),
+        token({
+          at: at(10, 3),
+          provider: "claude",
+          model: "claude-opus-5-5",
+          dedupeKey: "k2",
+          totals: { uncachedInputTokens: 200 },
+        }),
+      ],
+    });
+
+    const fiveHour = exported.buckets.find((bucket) => bucket.bucketId === "five_hour")!;
+    const sevenDay = exported.buckets.find((bucket) => bucket.bucketId === "seven_day")!;
+
+    assert.strictEqual(fiveHour.intervals.length, 2);
+    assert.strictEqual(fiveHour.intervals[0]?.quotaDeltaPercent, 15);
+    assert.strictEqual(fiveHour.intervals[0]?.tokenTotals.uncachedInputTokens, 100);
+    assert.strictEqual(fiveHour.intervals[1]?.quotaDeltaPercent, 5);
+    assert.strictEqual(fiveHour.intervals[1]?.tokenTotals.uncachedInputTokens, 200);
+
+    assert.strictEqual(sevenDay.intervals.length, 1);
+    assert.strictEqual(sevenDay.intervals[0]?.from.checkedAt, t0);
+    assert.strictEqual(sevenDay.intervals[0]?.to.checkedAt, t2);
+    assert.strictEqual(sevenDay.intervals[0]?.quotaDeltaPercent, 4);
+    assert.strictEqual(sevenDay.intervals[0]?.tokenTotals.uncachedInputTokens, 300);
+  });
+
+  it("preserves zeroSpendCap on exported observations and marks monthly_spend scope uncertain", () => {
+    const exported = exportQuotaHistory({
+      records: [
+        reading({
+          observedAt: at(10, 0),
+          driver: "claudeAgent",
+          providerInstanceId: "claudeAgent",
+          accountKey: "org-claude",
+          zeroSpendCap: true,
+          windows: [
+            { id: "monthly_spend", kind: "monthly", label: "Monthly spend", usedPercent: 0 },
+          ],
+        }),
+        reading({
+          observedAt: at(10, 5),
+          driver: "claudeAgent",
+          providerInstanceId: "claudeAgent",
+          accountKey: "org-claude",
+          zeroSpendCap: true,
+          windows: [
+            { id: "monthly_spend", kind: "monthly", label: "Monthly spend", usedPercent: 0 },
+          ],
+        }),
+      ],
+      tokens: [],
+    });
+
+    const monthlySpend = exported.buckets[0]!;
+    assert.strictEqual(monthlySpend.tokenAttributionUncertain, true);
+    assert.strictEqual(monthlySpend.intervals[0]?.tokenScopeUncertain, true);
+    assert.strictEqual(monthlySpend.intervals[0]?.from.zeroSpendCap, true);
+    assert.strictEqual(monthlySpend.intervals[0]?.to.zeroSpendCap, true);
+  });
+
+  it("does not treat missing resetCredits or expired grants as reset-credit redemptions", () => {
+    const missingCredits = exportQuotaHistory({
+      records: [
+        reading({
+          observedAt: at(10, 0),
+          windows: [{ id: "five_hour", usedPercent: 80, resetsAt: at(14, 0) }],
+          resetCredits: { availableCount: 2 },
+        }),
+        reading({
+          observedAt: at(10, 5),
+          windows: [{ id: "five_hour", usedPercent: 40, resetsAt: at(14, 0) }],
+        }),
+      ],
+      tokens: [],
+    });
+    assert.strictEqual(firstInterval(missingCredits).reset, false);
+    assert.strictEqual(firstInterval(missingCredits).lowerReading, true);
+
+    const expiredGrant = exportQuotaHistory({
+      records: [
+        reading({
+          observedAt: at(10, 0),
+          windows: [{ id: "five_hour", usedPercent: 80, resetsAt: at(14, 0) }],
+          resetCredits: { availableCount: 2, nextExpiresAt: at(10, 5) },
+        }),
+        reading({
+          observedAt: at(10, 5),
+          checkedAt: at(10, 5),
+          windows: [{ id: "five_hour", usedPercent: 40, resetsAt: at(14, 0) }],
+          resetCredits: { availableCount: 1 },
+        }),
+      ],
+      tokens: [],
+    });
+    assert.strictEqual(firstInterval(expiredGrant).reset, false);
+    assert.strictEqual(firstInterval(expiredGrant).lowerReading, true);
   });
 });

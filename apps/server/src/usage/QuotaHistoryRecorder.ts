@@ -78,10 +78,20 @@ export interface QuotaHistorySourceSnapshot {
 export interface QuotaHistoryInstanceState {
   /** The last processed read attempt, so republished snapshots are not recorded twice. */
   readonly lastReadAt: string;
+  /** The last non-partial read attempt, so partial notifications don't postpone full probes. */
+  readonly lastFullReadAt?: string;
+  /** Window IDs already recorded at `lastReadAt` for partial notifications; undefined means all windows. */
+  readonly lastReadWindowIds?: ReadonlyArray<string>;
   readonly hasReading: boolean;
   readonly lastReadingCheckedAt?: string;
   readonly accountKey?: string;
   readonly unsupported?: true;
+}
+
+function isPartialNotification(read: ServerProviderUsageRead | undefined): boolean {
+  return (
+    read?.source === "notification" && read.windowIds !== undefined && read.windowIds.length > 0
+  );
 }
 
 function quotaAccountKey(snapshot: QuotaHistorySourceSnapshot): string | undefined {
@@ -162,7 +172,20 @@ export function advanceQuotaHistory(input: {
   // explicit read attempt describes usage. Inferring failures from checkedAt reported a gap
   // for every Antigravity health check before its asynchronous usage probe finished.
   if (read === undefined) return { records: [], next: previous };
-  if (notAfter(read.attemptedAt, previous?.lastReadAt)) {
+  const partial = isPartialNotification(read);
+  const readTime = timeOf(read.attemptedAt);
+  const previousReadTime = previous === undefined ? undefined : timeOf(previous.lastReadAt);
+  const sameReadTimestamp =
+    readTime !== undefined && previousReadTime !== undefined && readTime === previousReadTime;
+  // Distinct partial notifications arriving in the same millisecond carry disjoint window IDs.
+  const sameTimestampNewWindowIds =
+    sameReadTimestamp && partial && previous?.lastReadWindowIds !== undefined
+      ? read.windowIds!.filter((id) => !previous.lastReadWindowIds!.includes(id))
+      : undefined;
+  if (
+    notAfter(read.attemptedAt, previous?.lastReadAt) &&
+    (sameTimestampNewWindowIds === undefined || sameTimestampNewWindowIds.length === 0)
+  ) {
     return { records: [], next: previous };
   }
 
@@ -172,8 +195,23 @@ export function advanceQuotaHistory(input: {
     previous?.accountKey !== undefined &&
     accountKey !== previous.accountKey;
   const carriedAccountKey = accountChanged ? accountKey : (accountKey ?? previous?.accountKey);
+  const lastFullReadAt = !partial
+    ? read.attemptedAt
+    : !accountChanged
+      ? previous?.lastFullReadAt
+      : undefined;
+  const nextReadWindowIds =
+    sameTimestampNewWindowIds !== undefined &&
+    sameTimestampNewWindowIds.length > 0 &&
+    previous?.lastReadWindowIds !== undefined
+      ? [...previous.lastReadWindowIds, ...sameTimestampNewWindowIds]
+      : partial
+        ? read.windowIds
+        : undefined;
   const base = {
     lastReadAt: read.attemptedAt,
+    ...(lastFullReadAt === undefined ? {} : { lastFullReadAt }),
+    ...(nextReadWindowIds === undefined ? {} : { lastReadWindowIds: nextReadWindowIds }),
     hasReading: !accountChanged && previous?.hasReading === true,
     ...(carriedAccountKey === undefined ? {} : { accountKey: carriedAccountKey }),
     ...(!accountChanged && previous?.lastReadingCheckedAt !== undefined
@@ -182,8 +220,25 @@ export function advanceQuotaHistory(input: {
   } satisfies QuotaHistoryInstanceState;
 
   if (read.outcome === "success" && usage !== undefined && usage.windows.length > 0) {
-    // A cached value keeps its original timestamp and is not a new reading.
-    if (notAfter(usage.checkedAt, previous?.lastReadingCheckedAt)) {
+    // A cached value keeps its original timestamp and is not a new reading,
+    // except when a distinct partial notification lands in the same millisecond.
+    const allowedWindowIds =
+      sameTimestampNewWindowIds !== undefined && sameTimestampNewWindowIds.length > 0
+        ? sameTimestampNewWindowIds
+        : partial
+          ? read.windowIds
+          : undefined;
+    if (
+      sameTimestampNewWindowIds === undefined &&
+      notAfter(usage.checkedAt, previous?.lastReadingCheckedAt)
+    ) {
+      return { records: [], next: base };
+    }
+    const scopedWindows =
+      allowedWindowIds !== undefined
+        ? usage.windows.filter((window) => allowedWindowIds.includes(window.id))
+        : usage.windows;
+    if (scopedWindows.length === 0) {
       return { records: [], next: base };
     }
     const record: QuotaHistoryReading = {
@@ -195,7 +250,7 @@ export function advanceQuotaHistory(input: {
       ...(accountKey === undefined ? {} : { accountKey }),
       source: read.source,
       checkedAt: usage.checkedAt,
-      windows: usage.windows.map((window) => reportWindow(snapshot.driver, window)),
+      windows: scopedWindows.map((window) => reportWindow(snapshot.driver, window)),
       ...(usage.resetCredits
         ? {
             resetCredits: {
@@ -212,6 +267,8 @@ export function advanceQuotaHistory(input: {
       records: [record],
       next: {
         lastReadAt: read.attemptedAt,
+        ...(lastFullReadAt === undefined ? {} : { lastFullReadAt }),
+        ...(nextReadWindowIds === undefined ? {} : { lastReadWindowIds: nextReadWindowIds }),
         hasReading: true,
         lastReadingCheckedAt: usage.checkedAt,
         ...(accountKey === undefined ? {} : { accountKey }),
@@ -280,7 +337,12 @@ const appendRecords = Effect.fn("QuotaHistoryRecorder.appendRecords")(function* 
   );
 });
 
-const OBSERVED_DRIVERS: ReadonlySet<string> = new Set(["antigravity", "codex", "opencode"]);
+const OBSERVED_DRIVERS: ReadonlySet<string> = new Set([
+  "antigravity",
+  "claudeAgent",
+  "codex",
+  "opencode",
+]);
 
 function sourceSnapshot(provider: ServerProvider): QuotaHistorySourceSnapshot {
   return {
@@ -309,6 +371,7 @@ export class QuotaHistoryRecorder extends Context.Service<
   QuotaHistoryRecorder,
   {
     readonly observe: (providers: ReadonlyArray<ServerProvider>) => Effect.Effect<void>;
+    readonly lastFullReadAt: Effect.Effect<ReadonlyMap<string, string>>;
   }
 >()("t3/usage/QuotaHistoryRecorder") {}
 
@@ -368,20 +431,34 @@ const make = Effect.gen(function* () {
     yield* observeLock.withPermit(observeProviders(providers));
   });
 
-  return QuotaHistoryRecorder.of({ observe });
+  const lastFullReadAt = Ref.get(states).pipe(
+    Effect.map((current) => {
+      const timestamps = new Map<string, string>();
+      for (const [instanceId, state] of current) {
+        if (state.lastFullReadAt !== undefined) {
+          timestamps.set(instanceId, state.lastFullReadAt);
+        }
+      }
+      return timestamps as ReadonlyMap<string, string>;
+    }),
+  );
+
+  return QuotaHistoryRecorder.of({ observe, lastFullReadAt });
 });
 
 export const layer = Layer.effect(QuotaHistoryRecorder, make);
 
 /**
- * Providers whose last explicit usage read is older than the refresh interval.
- * A fresh `usageRead` means the foreground tick, a notification or an earlier
- * background sample already covered this interval.
+ * Providers whose last explicit full usage read is older than the refresh interval.
+ * A fresh full `usageRead` means the foreground tick, a complete notification or an
+ * earlier background sample already covered this interval. Partial notifications only
+ * cover a subset of windows and do not postpone a full probe.
  */
 export function quotaHistorySampleIds(
   providers: ReadonlyArray<ServerProvider>,
   nowMs: number,
   intervalMs: number,
+  lastFullReadAt?: ReadonlyMap<string, string>,
 ): ReadonlyArray<ServerProvider["instanceId"]> {
   if (intervalMs <= 0) return [];
   const due: Array<ServerProvider["instanceId"]> = [];
@@ -390,7 +467,9 @@ export function quotaHistorySampleIds(
     if (provider.auth.status === "unauthenticated") continue;
     // An unsupported account has nothing to read; a missing reading can still recover.
     if (provider.usageLimits?.unavailable?.reason === "unsupported") continue;
-    const attemptedAt = provider.usageRead?.attemptedAt;
+    const attemptedAt = isPartialNotification(provider.usageRead)
+      ? lastFullReadAt?.get(provider.instanceId)
+      : provider.usageRead?.attemptedAt;
     const attemptedMs = attemptedAt === undefined ? undefined : Date.parse(attemptedAt);
     if (
       attemptedMs !== undefined &&
@@ -455,6 +534,7 @@ export const collectorLayer: Layer.Layer<
               providers,
               yield* Clock.currentTimeMillis,
               intervalMs,
+              yield* recorder.lastFullReadAt,
             );
             if (due.length === 0) return;
             if (!(yield* backgroundPolicy.shouldRunUsageSampling)) return;

@@ -17,6 +17,7 @@ import { Command, Flag } from "effect/cli";
 import * as Option from "effect/Option";
 
 import { readAntigravityUsage } from "../src/provider/Drivers/antigravityUsageReader.ts";
+import { claudeUsageFormat } from "../src/provider/Drivers/claudeUsage.ts";
 import { codexUsageFormat } from "../src/provider/Drivers/codexUsage.ts";
 import {
   exportQuotaHistory,
@@ -58,11 +59,6 @@ const quotaFileName = new RegExp(
   `^quota-history-v${QUOTA_HISTORY_VERSION}-\\d{4}-\\d{2}-\\d{2}\\.ndjson$`,
 );
 const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
-// Read once outside Effect code; the CLI is the only consumer.
-const XDG_DATA_HOME = process.env["XDG_DATA_HOME"];
-const CODEX_HOME = process.env["CODEX_HOME"];
-const OPENCODE_DATA_DIR = process.env["OPENCODE_DATA_DIR"];
-const ANTIGRAVITY_DATA_DIR = process.env["ANTIGRAVITY_DATA_DIR"];
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 function compareText(left: string, right: string): number {
@@ -155,8 +151,11 @@ export const readCodexTokens = Effect.fn("readCodexTokens")(function* (
   sessionsDirs: ReadonlyArray<string>,
   sinceMs: number,
 ) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const readFiles: Array<{ readonly path: string; readonly records: ReadonlyArray<UsageRecord> }> =
     [];
+  const seenPaths = new Set<string>();
   let fileCount = 0;
   let failures = 0;
   // A rollout can be present under more than one root, so shared-session detection
@@ -165,8 +164,13 @@ export const readCodexTokens = Effect.fn("readCodexTokens")(function* (
     const listed = yield* Effect.promise(() => listTranscriptFiles(sessionsDir, sinceMs));
     failures += listed.failedPaths;
     const files = listed.files.toSorted((left, right) => compareText(left.path, right.path));
-    fileCount += files.length;
     for (const file of files) {
+      const canonicalPath = yield* fs
+        .realPath(file.path)
+        .pipe(Effect.orElseSucceed(() => path.resolve(file.path)));
+      if (seenPaths.has(canonicalPath)) continue;
+      seenPaths.add(canonicalPath);
+      fileCount += 1;
       const parsed = yield* Effect.promise(() =>
         readTranscriptRecords(file.path, codexUsageFormat),
       );
@@ -174,7 +178,10 @@ export const readCodexTokens = Effect.fn("readCodexTokens")(function* (
         failures += 1;
         continue;
       }
-      readFiles.push({ path: file.path, records: [...parsed.records, ...parsed.tailRecords] });
+      const fileRecords: UsageRecord[] = [];
+      for (const record of parsed.records) fileRecords.push(record);
+      for (const record of parsed.tailRecords) fileRecords.push(record);
+      readFiles.push({ path: canonicalPath, records: fileRecords });
     }
   }
   // A moved rollout can appear in two files, so Codex needs UsageService's cross-file
@@ -194,13 +201,50 @@ export const readCodexTokens = Effect.fn("readCodexTokens")(function* (
   return { records, files: fileCount, failures } satisfies TokenRead;
 });
 
+export const readClaudeTokens = Effect.fn("readClaudeTokens")(function* (
+  projectsDirs: ReadonlyArray<string>,
+  sinceMs: number,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const records: UsageRecord[] = [];
+  const seenPaths = new Set<string>();
+  let fileCount = 0;
+  let failures = 0;
+  for (const projectsDir of projectsDirs) {
+    const listed = yield* Effect.promise(() => listTranscriptFiles(projectsDir, sinceMs));
+    failures += listed.failedPaths;
+    const files = listed.files.toSorted((left, right) => compareText(left.path, right.path));
+    for (const file of files) {
+      const canonicalPath = yield* fs
+        .realPath(file.path)
+        .pipe(Effect.orElseSucceed(() => path.resolve(file.path)));
+      if (seenPaths.has(canonicalPath)) continue;
+      seenPaths.add(canonicalPath);
+      fileCount += 1;
+      const parsed = yield* Effect.promise(() =>
+        readTranscriptRecords(file.path, claudeUsageFormat),
+      );
+      if (parsed === null) {
+        failures += 1;
+        continue;
+      }
+      for (const record of parsed.records) records.push(record);
+      for (const record of parsed.tailRecords) records.push(record);
+    }
+  }
+  return { records, files: fileCount, failures } satisfies TokenRead;
+});
+
 const readAntigravityTokens = Effect.fn("readAntigravityTokens")(function* (
   directories: ReadonlyArray<string>,
   sinceMs: number,
 ) {
   const result = yield* readAntigravityUsage(directories, sinceMs);
   const records: UsageRecord[] = [];
-  for (const file of result.files) records.push(...file.records);
+  for (const file of result.files) {
+    for (const record of file.records) records.push(record);
+  }
   return {
     records,
     files: result.files.length,
@@ -219,13 +263,16 @@ const readOpenCodeTokens = Effect.fn("readOpenCodeTokens")(function* (
     const result = yield* readOpenCodeUsage(root, sinceMs);
     files += result.files.length;
     if (result.error) failures += 1;
-    for (const file of result.files) records.push(...file.records);
+    for (const file of result.files) {
+      for (const record of file.records) records.push(record);
+    }
   }
   return { records, files, failures } satisfies TokenRead;
 });
 
 interface TokenRoots {
   readonly codexSessions: ReadonlyArray<string>;
+  readonly claudeProjects: ReadonlyArray<string>;
   readonly antigravityData: ReadonlyArray<string>;
   readonly opencodeData: ReadonlyArray<string>;
 }
@@ -243,20 +290,25 @@ const isDirectory = Effect.fn("isDirectory")(function* (path: Path.Path, target:
 const resolveTokenRoots = Effect.fn("resolveTokenRoots")(function* (input: {
   readonly explicit: {
     readonly codexSessions: ReadonlyArray<string>;
+    readonly claudeProjects: ReadonlyArray<string>;
     readonly antigravityData: ReadonlyArray<string>;
     readonly opencodeData: ReadonlyArray<string>;
   };
   readonly stateDir: string | undefined;
 }) {
   const home = yield* HostProcess.HomeDirectory;
+  const env = yield* HostProcess.Environment;
   const path = yield* Path.Path;
   const fs = yield* FileSystem.FileSystem;
+  const normalizeRoots = (roots: ReadonlyArray<string>) =>
+    roots.map((root) => path.resolve(expandHomePath(root, home)));
   const environmentRoots = (value: string | undefined) =>
-    (value ?? "")
-      .split(",")
-      .map((root) => root.trim())
-      .filter(Boolean)
-      .map((root) => path.resolve(expandHomePath(root, home)));
+    normalizeRoots(
+      (value ?? "")
+        .split(",")
+        .map((root) => root.trim())
+        .filter(Boolean),
+    );
   const existing = (roots: ReadonlyArray<string>) =>
     Effect.filter(roots, (root) =>
       isDirectory(path, root).pipe(Effect.map((resolved) => resolved !== undefined)),
@@ -282,20 +334,20 @@ const resolveTokenRoots = Effect.fn("resolveTokenRoots")(function* (input: {
     }
   }
 
-  const antigravityEnvironmentRoots = environmentRoots(ANTIGRAVITY_DATA_DIR);
+  const antigravityEnvironmentRoots = environmentRoots(env["ANTIGRAVITY_DATA_DIR"]);
   const defaultAntigravity =
     antigravityEnvironmentRoots.length > 0
       ? antigravityEnvironmentRoots
       : defaultAntigravityRoots(home, path);
   const antigravityData =
     input.explicit.antigravityData.length > 0
-      ? [...input.explicit.antigravityData, ...managedAntigravity]
+      ? [...normalizeRoots(input.explicit.antigravityData), ...managedAntigravity]
       : [
           ...(yield* existing(yield* preferConversations(defaultAntigravity))),
           ...managedAntigravity,
         ];
 
-  const codexHome = CODEX_HOME?.trim();
+  const codexHome = env["CODEX_HOME"]?.trim();
   const codexDefaultRoots = [
     codexHome
       ? path.join(path.resolve(expandHomePath(codexHome, home)), "sessions")
@@ -303,21 +355,36 @@ const resolveTokenRoots = Effect.fn("resolveTokenRoots")(function* (input: {
   ];
   const codexSessions =
     input.explicit.codexSessions.length > 0
-      ? input.explicit.codexSessions
+      ? normalizeRoots(input.explicit.codexSessions)
       : yield* existing(codexDefaultRoots);
 
-  const opencodeEnvironmentRoots = environmentRoots(OPENCODE_DATA_DIR);
+  const claudeConfigDir = env["CLAUDE_CONFIG_DIR"]?.trim();
+  const claudeDefaultRoots = [
+    path.join(
+      claudeConfigDir
+        ? path.resolve(expandHomePath(claudeConfigDir, home))
+        : path.join(home, ".claude"),
+      "projects",
+    ),
+  ];
+  const claudeProjects =
+    input.explicit.claudeProjects.length > 0
+      ? normalizeRoots(input.explicit.claudeProjects)
+      : yield* existing(claudeDefaultRoots);
+
+  const opencodeEnvironmentRoots = environmentRoots(env["OPENCODE_DATA_DIR"]);
   const opencodeDefault =
     opencodeEnvironmentRoots.length > 0
       ? opencodeEnvironmentRoots
-      : [path.join(XDG_DATA_HOME?.trim() || path.join(home, ".local", "share"), "opencode")];
+      : [path.join(env["XDG_DATA_HOME"]?.trim() || path.join(home, ".local", "share"), "opencode")];
   const opencodeData =
     input.explicit.opencodeData.length > 0
-      ? input.explicit.opencodeData
+      ? normalizeRoots(input.explicit.opencodeData)
       : yield* existing(opencodeDefault);
 
   return {
     codexSessions,
+    claudeProjects,
     antigravityData,
     opencodeData,
   } satisfies TokenRoots;
@@ -343,9 +410,10 @@ function earliestCheckedAt(records: ReadonlyArray<QuotaHistoryRecord>): number |
   return earliest;
 }
 
-const runExport = Effect.fn("runQuotaHistoryExport")(function* (input: {
+export const runExport = Effect.fn("runQuotaHistoryExport")(function* (input: {
   readonly logsDir: string;
   readonly codexSessions: ReadonlyArray<string>;
+  readonly claudeProjects: ReadonlyArray<string>;
   readonly antigravityData: ReadonlyArray<string>;
   readonly opencodeData: ReadonlyArray<string>;
   readonly stateDir: string | undefined;
@@ -369,6 +437,7 @@ const runExport = Effect.fn("runQuotaHistoryExport")(function* (input: {
   const roots = yield* resolveTokenRoots({
     explicit: {
       codexSessions: input.codexSessions,
+      claudeProjects: input.claudeProjects,
       antigravityData: input.antigravityData,
       opencodeData: input.opencodeData,
     },
@@ -421,7 +490,7 @@ const runExport = Effect.fn("runQuotaHistoryExport")(function* (input: {
   let tokenFiles = 0;
   let tokenFailures = 0;
   const collect = (result: TokenRead, label: string) => {
-    tokens.push(...result.records);
+    for (const record of result.records) tokens.push(record);
     tokenFiles += result.files;
     tokenFailures += result.failures;
     return progress(
@@ -434,6 +503,10 @@ const runExport = Effect.fn("runQuotaHistoryExport")(function* (input: {
     if (roots.codexSessions.length > 0) {
       yield* progress(`reading codex tokens from ${roots.codexSessions.join(", ")}`);
       yield* collect(yield* readCodexTokens(roots.codexSessions, tokenSinceMs), "codex");
+    }
+    if (roots.claudeProjects.length > 0) {
+      yield* progress(`reading claude tokens from ${roots.claudeProjects.join(", ")}`);
+      yield* collect(yield* readClaudeTokens(roots.claudeProjects, tokenSinceMs), "claude");
     }
     if (roots.antigravityData.length > 0) {
       yield* progress("reading antigravity tokens");
@@ -473,7 +546,7 @@ const runExport = Effect.fn("runQuotaHistoryExport")(function* (input: {
   return exported;
 });
 
-const exportCommand = Command.make(
+export const exportCommand = Command.make(
   "export-quota-history",
   {
     logsDir: Flag.String("logs-dir").pipe(
@@ -485,6 +558,12 @@ const exportCommand = Command.make(
       Flag.optional,
       Flag.withDescription(
         "A Codex sessions directory. Repeatable through a comma-separated list.",
+      ),
+    ),
+    claudeProjects: Flag.String("claude-projects").pipe(
+      Flag.optional,
+      Flag.withDescription(
+        "A Claude projects directory containing .jsonl transcripts. Repeatable through a comma-separated list.",
       ),
     ),
     antigravityData: Flag.String("antigravity-data").pipe(
@@ -525,6 +604,7 @@ const exportCommand = Command.make(
       yield* runExport({
         logsDir: config.logsDir,
         codexSessions: splitRoots(config.codexSessions),
+        claudeProjects: splitRoots(config.claudeProjects),
         antigravityData: splitRoots(config.antigravityData),
         opencodeData: splitRoots(config.opencodeData),
         stateDir: Option.getOrUndefined(config.stateDir),

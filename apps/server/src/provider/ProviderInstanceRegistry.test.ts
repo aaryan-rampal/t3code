@@ -56,6 +56,7 @@ import * as ProviderHostLive from "./ProviderHostLive.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as SecretResolver from "@t3tools/secret-provider-core/server/SecretResolver";
 import type { AnyProviderDriver, ProviderInstance } from "@t3tools/provider-core/server/driver";
+import { advanceQuotaHistory } from "../usage/QuotaHistoryRecorder.ts";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", { spy: true });
 
@@ -71,31 +72,32 @@ const windowsHost = HostProcess.Platform.defaultValue() === "win32";
 
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 
-const layerBackgroundPolicyAlwaysRun = Layer.mock(BackgroundPolicy.BackgroundPolicy)({
-  reportClientActivity: () => Effect.void,
-  removeRpcClient: () => Effect.void,
-  snapshot: Effect.succeed({
-    hostPower: {
-      source: "unknown",
-      idle: "unknown",
-      idleSeconds: null,
-      locked: "unknown",
-      suspended: false,
-      onBattery: "unknown",
-      lowPowerMode: "unknown",
-      thermalState: "unknown",
-      stale: true,
+const makeBackgroundPolicyLayer = (shouldRun: boolean) =>
+  Layer.mock(BackgroundPolicy.BackgroundPolicy)({
+    reportClientActivity: () => Effect.void,
+    removeRpcClient: () => Effect.void,
+    snapshot: Effect.succeed({
+      hostPower: {
+        source: "unknown",
+        idle: "unknown",
+        idleSeconds: null,
+        locked: "unknown",
+        suspended: false,
+        onBattery: "unknown",
+        lowPowerMode: "unknown",
+        thermalState: "unknown",
+        stale: true,
+        updatedAt: TEST_EPOCH,
+      },
+      leases: [],
+      activeForegroundLeaseCount: 0,
+      activeScopeKeys: [],
+      shouldRunOpportunisticWork: shouldRun,
       updatedAt: TEST_EPOCH,
-    },
-    leases: [],
-    activeForegroundLeaseCount: 0,
-    activeScopeKeys: [],
-    shouldRunOpportunisticWork: true,
-    updatedAt: TEST_EPOCH,
-  }),
-  shouldRunScopeWork: () => Effect.succeed(true),
-  shouldRunOpportunisticWork: Effect.succeed(true),
-});
+    }),
+    shouldRunScopeWork: () => Effect.succeed(shouldRun),
+    shouldRunOpportunisticWork: Effect.succeed(shouldRun),
+  });
 
 const makeCodexConfig = (overrides: Partial<CodexSettings>): CodexSettings => ({
   enabled: false,
@@ -172,51 +174,55 @@ const makeTildeProviderFixtures = Effect.fn(
 });
 
 describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
-  const layerBaseDeps = ServerConfig.layerTest(process.cwd(), {
-    prefix: "provider-instance-registry-test",
-  }).pipe(
-    Layer.provideMerge(
-      Layer.mock(CodexManagedTokenBroker.CodexManagedTokenBroker)({
-        endpoint: Effect.succeed("unused-private-pipe"),
-      }),
-    ),
-    Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
-    Layer.provideMerge(
-      Layer.mock(CodexInstallation.CodexInstallation)({
-        managedDirectory: "unused-managed-installation",
-      }),
-    ),
-    Layer.provideMerge(Layer.mock(ServerSecretStore.ServerSecretStore)({})),
-    Layer.provideMerge(Layer.mock(SecretResolver.SecretResolver)({})),
-    Layer.provideMerge(
-      Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
-        getEnvironmentId: Effect.succeed(
-          EnvironmentId.make("00000000-0000-4000-8000-000000000001"),
-        ),
-      }),
-    ),
-    Layer.provideMerge(layerBackgroundPolicyAlwaysRun),
-    Layer.provideMerge(ServerSettings.layerTest()),
-    Layer.provideMerge(layerTestHttpClient),
-    Layer.provideMerge(ServerSettings.layerTest()),
-    Layer.provideMerge(
-      Layer.succeed(
-        ProviderEventLoggers.ProviderEventLoggers,
-        ProviderEventLoggers.NoOpProviderEventLoggers,
+  const makeLayerTest = (runBackgroundWork: boolean) => {
+    const layerDeps = ServerConfig.layerTest(process.cwd(), {
+      prefix: "provider-instance-registry-test",
+    }).pipe(
+      Layer.provideMerge(
+        Layer.mock(CodexManagedTokenBroker.CodexManagedTokenBroker)({
+          endpoint: Effect.succeed("unused-private-pipe"),
+        }),
       ),
-    ),
-    Layer.provideMerge(ProviderLatestVersions.layer),
-    Layer.provideMerge(McpProviderSessions.layer),
-    Layer.provideMerge(ProviderInstallationGate.layer),
-    Layer.provideMerge(ModelManifest.layerTest),
-    Layer.provideMerge(ResetCreditCoordinator.layerTest),
-  );
-  const layerBase = ProviderHostLive.layer.pipe(Layer.provideMerge(layerBaseDeps));
-  const layerTest = ProviderOrchestrationAdapterInfrastructure.layer.pipe(
-    Layer.provide(SqlitePersistence.layerMemory),
-    Layer.provideMerge(PortScanner.layerTest),
-    Layer.provideMerge(layerBase),
-  );
+      Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+      Layer.provideMerge(
+        Layer.mock(CodexInstallation.CodexInstallation)({
+          managedDirectory: "unused-managed-installation",
+        }),
+      ),
+      Layer.provideMerge(Layer.mock(ServerSecretStore.ServerSecretStore)({})),
+      Layer.provideMerge(Layer.mock(SecretResolver.SecretResolver)({})),
+      Layer.provideMerge(
+        Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
+          getEnvironmentId: Effect.succeed(
+            EnvironmentId.make("00000000-0000-4000-8000-000000000001"),
+          ),
+        }),
+      ),
+      Layer.provideMerge(makeBackgroundPolicyLayer(runBackgroundWork)),
+      Layer.provideMerge(ServerSettings.layerTest()),
+      Layer.provideMerge(layerTestHttpClient),
+      Layer.provideMerge(ServerSettings.layerTest()),
+      Layer.provideMerge(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+      Layer.provideMerge(ProviderLatestVersions.layer),
+      Layer.provideMerge(McpProviderSessions.layer),
+      Layer.provideMerge(ProviderInstallationGate.layer),
+      Layer.provideMerge(ModelManifest.layerTest),
+      Layer.provideMerge(ResetCreditCoordinator.layerTest),
+    );
+    const base = ProviderHostLive.layer.pipe(Layer.provideMerge(layerDeps));
+    return ProviderOrchestrationAdapterInfrastructure.layer.pipe(
+      Layer.provide(SqlitePersistence.layerMemory),
+      Layer.provideMerge(PortScanner.layerTest),
+      Layer.provideMerge(base),
+    );
+  };
+  const layerTest = makeLayerTest(true);
+  const layerPausedForegroundTest = makeLayerTest(false);
 
   it.effect.each(["replacement", "removal", "creation failure"] as const)(
     "detaches retired provider scopes after repeated %s",
@@ -713,7 +719,11 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
         message: "Claude Agent CLI failed while checking account status.",
       });
       expect(accountChangedFailure.checkedAt).not.toBe(first.checkedAt);
-      expect(accountChangedFailure.usageLimits).toBeUndefined();
+      expect(accountChangedFailure.usageLimits).toEqual({
+        checkedAt: accountChangedFailure.checkedAt,
+        windows: [],
+        unavailable: { reason: "probeFailed" },
+      });
       expect(accountChangedFailure.slashCommands).not.toEqual(
         expect.arrayContaining([expect.objectContaining({ name: "last-good" })]),
       );
@@ -756,6 +766,258 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
       );
       expect(probeCount).toBeGreaterThan(sameAccountFailureProbeCount);
     }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "samples fresh Claude usage when foreground refresh is paused and preserves fallback on failure",
+    () =>
+      Effect.gen(function* () {
+        if (yield* HostProcess.isWindows) return;
+
+        yield* TestClock.setTime(Date.parse("2026-11-25T10:00:00.000Z"));
+        const fixtures = yield* makeTildeProviderFixtures();
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        yield* fs.writeFileString(
+          path.join(fixtures.claudeHomePath, ".claude.json"),
+          JSON.stringify({ oauthAccount: { organizationUuid: "org-sample" } }),
+        );
+        const claudeId = ProviderInstanceId.make("claude_usage_sample");
+        let probeCount = 0;
+        let utilization = 15;
+        let failProbe = false;
+        const query = vi.spyOn(ClaudeSdk, "query").mockImplementation(
+          () =>
+            ({
+              initializationResult: () => {
+                probeCount++;
+                if (failProbe) return Promise.reject(new Error("probe failed"));
+                return Promise.resolve({
+                  commands: [],
+                  account: {
+                    email: "sample@example.com",
+                    subscriptionType: "pro",
+                    tokenSource: "oauth",
+                  },
+                });
+              },
+              usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+                rate_limits_available: true,
+                rate_limits: {
+                  five_hour: { utilization, resets_at: "2026-11-25T14:00:00Z" },
+                },
+              }),
+            }) as ReturnType<typeof ClaudeSdk.query>,
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(() => query.mockRestore()));
+
+        const { registry } = yield* makeProviderInstanceRegistry<ClaudeDriverEnv>({
+          drivers: [ClaudeDriver],
+          configMap: {
+            [claudeId]: {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              enabled: true,
+              config: makeClaudeConfig({
+                enabled: true,
+                binaryPath: fixtures.claudeBinaryPath,
+                homePath: fixtures.claudeHomePath,
+              }),
+            },
+          },
+        });
+        const claude = yield* registry.getInstance(claudeId);
+        expect(claude).toBeDefined();
+        expect(claude!.snapshot.sampleUsage).toBeDefined();
+
+        const initial = yield* claude!.snapshot.refresh;
+        expect(initial.usageLimits?.windows[0]?.usedPercent).toBe(15);
+        expect(initial.usageRead).toEqual({
+          attemptedAt: "2026-11-25T10:00:00.000Z",
+          source: "probe",
+          outcome: "success",
+        });
+        const initialProbeCount = probeCount;
+
+        // Foreground refresh is paused (within 5m cache TTL), yet sampleUsage invalidates
+        // capabilitiesProbeCache and reads fresh usage.
+        yield* TestClock.setTime(Date.parse("2026-11-25T10:01:00.000Z"));
+        utilization = 42;
+        yield* claude!.snapshot.sampleUsage!;
+        expect(probeCount).toBe(initialProbeCount + 1);
+        const sampled = yield* claude!.snapshot.getSnapshot;
+        expect(sampled.usageLimits?.windows[0]?.usedPercent).toBe(42);
+        expect(sampled.usageLimits?.accountKey).toBe("org-sample");
+        expect(sampled.usageRead).toEqual({
+          attemptedAt: "2026-11-25T10:01:00.000Z",
+          source: "probe",
+          outcome: "success",
+        });
+
+        // If the account switches orgs while foreground refresh is paused, sampleUsage
+        // must not publish the new org's quota under the old snapshot's auth.
+        yield* TestClock.setTime(Date.parse("2026-11-25T10:02:00.000Z"));
+        yield* fs.writeFileString(
+          path.join(fixtures.claudeHomePath, ".claude.json"),
+          JSON.stringify({ oauthAccount: { organizationUuid: "org-other" } }),
+        );
+        utilization = 99;
+        yield* claude!.snapshot.sampleUsage!;
+        const afterOrgSwitch = yield* claude!.snapshot.getSnapshot;
+        expect(afterOrgSwitch.auth.workspaceId).toBe("org-sample");
+        expect(afterOrgSwitch.usageLimits?.windows[0]?.usedPercent).toBe(42);
+        expect(afterOrgSwitch.usageRead).toEqual({
+          attemptedAt: "2026-11-25T10:01:00.000Z",
+          source: "probe",
+          outcome: "success",
+        });
+
+        // Switch back to the original org before testing failed-sample fallback behavior.
+        yield* fs.writeFileString(
+          path.join(fixtures.claudeHomePath, ".claude.json"),
+          JSON.stringify({ oauthAccount: { organizationUuid: "org-sample" } }),
+        );
+
+        // A failed background sample retains the last good windows, advances usageRead to failed,
+        // and leaves lastGoodCapabilities intact for the next foreground refresh.
+        yield* TestClock.setTime(Date.parse("2026-11-25T10:06:00.000Z"));
+        failProbe = true;
+        yield* claude!.snapshot.sampleUsage!;
+        const afterFailedSample = yield* claude!.snapshot.getSnapshot;
+        expect(afterFailedSample.usageLimits?.windows[0]?.usedPercent).toBe(42);
+        expect(afterFailedSample.usageRead).toEqual({
+          attemptedAt: "2026-11-25T10:06:00.000Z",
+          source: "probe",
+          outcome: "failed",
+        });
+
+        // Foreground refresh still has its one-probe same-account fallback available.
+        yield* TestClock.setTime(Date.parse("2026-11-25T10:07:00.000Z"));
+        const foregroundFallback = yield* claude!.snapshot.refresh;
+        expect(foregroundFallback.status).toBe("ready");
+        expect(foregroundFallback.auth.status).toBe("authenticated");
+        expect(foregroundFallback.usageLimits?.windows[0]?.usedPercent).toBe(42);
+        expect(foregroundFallback.usageRead).toEqual({
+          attemptedAt: "2026-11-25T10:07:00.000Z",
+          source: "probe",
+          outcome: "failed",
+        });
+      }).pipe(Effect.provide(layerPausedForegroundTest)),
+  );
+
+  it.effect(
+    "advances usageRead.attemptedAt on same-account cache fallback so QuotaHistoryRecorder records a probeFailed gap",
+    () =>
+      Effect.gen(function* () {
+        if (yield* HostProcess.isWindows) return;
+
+        yield* TestClock.setTime(Date.parse("2026-11-25T10:00:00.000Z"));
+        const fixtures = yield* makeTildeProviderFixtures();
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        yield* fs.writeFileString(
+          path.join(fixtures.claudeHomePath, ".claude.json"),
+          JSON.stringify({ oauthAccount: { organizationUuid: "org-fallback" } }),
+        );
+        const claudeId = ProviderInstanceId.make("claude_fallback_gap");
+        let failProbe = false;
+        const query = vi.spyOn(ClaudeSdk, "query").mockImplementation(
+          () =>
+            ({
+              initializationResult: () => {
+                if (failProbe) return Promise.reject(new Error("probe failed"));
+                return Promise.resolve({
+                  commands: [],
+                  account: {
+                    email: "fallback@example.com",
+                    subscriptionType: "pro",
+                    tokenSource: "oauth",
+                  },
+                });
+              },
+              usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => ({
+                rate_limits_available: true,
+                rate_limits: {
+                  five_hour: { utilization: 25, resets_at: "2026-11-25T14:00:00Z" },
+                },
+              }),
+            }) as ReturnType<typeof ClaudeSdk.query>,
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(() => query.mockRestore()));
+
+        const { registry } = yield* makeProviderInstanceRegistry<ClaudeDriverEnv>({
+          drivers: [ClaudeDriver],
+          configMap: {
+            [claudeId]: {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              enabled: true,
+              config: makeClaudeConfig({
+                enabled: true,
+                binaryPath: fixtures.claudeBinaryPath,
+                homePath: fixtures.claudeHomePath,
+              }),
+            },
+          },
+        });
+        const claude = yield* registry.getInstance(claudeId);
+        const first = yield* claude!.snapshot.refresh;
+        expect(first.usageRead).toEqual({
+          attemptedAt: "2026-11-25T10:00:00.000Z",
+          source: "probe",
+          outcome: "success",
+        });
+
+        // Expire the 5-minute capabilities cache, then fail the next probe for the same account.
+        yield* TestClock.setTime(Date.parse("2026-11-25T10:06:00.000Z"));
+        failProbe = true;
+        const fallback = yield* claude!.snapshot.refresh;
+        expect(fallback.status).toBe("ready");
+        expect(fallback.usageLimits?.checkedAt).toBe("2026-11-25T10:00:00.000Z");
+        expect(fallback.usageRead).toEqual({
+          attemptedAt: "2026-11-25T10:06:00.000Z",
+          source: "probe",
+          outcome: "failed",
+        });
+
+        const baseline = advanceQuotaHistory({
+          previous: undefined,
+          snapshot: {
+            providerInstanceId: first.instanceId,
+            driver: first.driver,
+            checkedAt: first.checkedAt,
+            auth: first.auth,
+            ...(first.usageLimits ? { usageLimits: first.usageLimits } : {}),
+            ...(first.usageRead ? { usageRead: first.usageRead } : {}),
+          },
+          observedAt: "2026-11-25T10:00:01.000Z",
+        });
+        expect(baseline.records).toHaveLength(1);
+        expect(baseline.records[0]?.kind).toBe("reading");
+
+        const gapStep = advanceQuotaHistory({
+          previous: baseline.next,
+          snapshot: {
+            providerInstanceId: fallback.instanceId,
+            driver: fallback.driver,
+            checkedAt: fallback.checkedAt,
+            auth: fallback.auth,
+            ...(fallback.usageLimits ? { usageLimits: fallback.usageLimits } : {}),
+            ...(fallback.usageRead ? { usageRead: fallback.usageRead } : {}),
+          },
+          observedAt: "2026-11-25T10:06:01.000Z",
+        });
+        expect(gapStep.records).toEqual([
+          {
+            version: 1,
+            kind: "gap",
+            observedAt: "2026-11-25T10:06:01.000Z",
+            providerInstanceId: claudeId,
+            driver: "claudeAgent",
+            accountKey: "org-fallback",
+            source: "probe",
+            reason: "probeFailed",
+          },
+        ]);
+      }).pipe(Effect.provide(layerPausedForegroundTest)),
   );
 
   const redeemClaudeReset = (claim: { result: string; usageFailsAfterClaim: boolean }) =>

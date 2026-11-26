@@ -341,6 +341,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
                 attemptedAt: update.checkedAt,
                 source: "notification",
                 usageLimits,
+                ...(complete ? {} : { windowIds: update.windows.map((window) => window.id) }),
               });
         const snapshot =
           usageRead === withLimits.usageRead ? withLimits : { ...withLimits, usageRead };
