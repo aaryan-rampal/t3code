@@ -166,6 +166,8 @@ export const readServerUsageLimits = Effect.fn("OpenCode2Client.usageLimits")(fu
             modelIds: [`${model.providerID}/${model.modelID}`],
             usedPercent: budgetPercent(model.spent ?? budget.spent, budget.limit),
             resetsAt: resetTime(budget.resetsAt),
+            spent: model.spent ?? budget.spent,
+            limit: budget.limit,
           });
         }
       } else {
@@ -183,10 +185,17 @@ export const readServerUsageLimits = Effect.fn("OpenCode2Client.usageLimits")(fu
               : { providerIds: consoleProviders }),
           usedPercent: budgetPercent(budget.spent, budget.limit),
           resetsAt: resetTime(budget.resetsAt),
+          spent: budget.spent,
+          limit: budget.limit,
         });
       }
     }
-    return { ...makeUsageLimits({ checkedAt, windows }), ...externalUsage };
+    const accountKey = workspace.id.trim();
+    return {
+      ...makeUsageLimits({ checkedAt, windows }),
+      ...(accountKey.length === 0 ? {} : { accountKey }),
+      ...externalUsage,
+    };
   }).pipe(
     Effect.timeout("5 seconds"),
     Effect.orElseSucceed(() =>

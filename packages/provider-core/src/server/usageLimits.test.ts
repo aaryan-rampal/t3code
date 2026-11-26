@@ -73,6 +73,31 @@ describe("applyUsageLimitsUpdate", () => {
     });
   });
 
+  it("keeps a budget window's original spend and limit through a percent-only update", () => {
+    const budget = {
+      id: "budget_all",
+      kind: "other",
+      label: "Console · Shared · All spend",
+      usedPercent: 75,
+      spent: 15,
+      limit: 20,
+    } as const;
+    const previous = { checkedAt, windows: [budget] };
+    const percentOnly = applyUsageLimitsUpdate({
+      previous,
+      checkedAt: "2026-09-03T12:00:05.000Z",
+      update: { windows: [{ ...budget, usedPercent: 80, spent: undefined, limit: undefined }] },
+    });
+    expect(percentOnly?.windows[0]).toEqual({ ...budget, usedPercent: 80 });
+
+    const spentMoved = applyUsageLimitsUpdate({
+      previous,
+      checkedAt: "2026-09-03T12:00:05.000Z",
+      update: { windows: [{ ...budget, spent: 16 }] },
+    });
+    expect(spentMoved?.windows[0]).toEqual({ ...budget, spent: 16 });
+  });
+
   it("leaves an unsupported account and an empty update alone", () => {
     const unsupported = { checkedAt, windows: [], unavailable: { reason: "unsupported" as const } };
     expect(
@@ -83,10 +108,42 @@ describe("applyUsageLimitsUpdate", () => {
     ).toBe(published);
   });
 
-  it("marks a first sparse update as unavailable", () => {
+  it("keeps a failed probe marker through a sparse update so recovery retries", () => {
+    const failed = {
+      checkedAt,
+      windows: [session],
+      unavailable: { reason: "probeFailed" as const },
+    };
+    expect(
+      applyUsageLimitsUpdate({
+        previous: failed,
+        checkedAt: "2026-09-03T12:00:05.000Z",
+        update: { windows: [{ ...session, usedPercent: 55 }] },
+      }),
+    ).toEqual({
+      checkedAt: "2026-09-03T12:00:05.000Z",
+      windows: [{ ...session, usedPercent: 55 }],
+      unavailable: { reason: "probeFailed" },
+    });
+  });
+
+  it("treats a first sparse update with windows as a successful read", () => {
     expect(
       applyUsageLimitsUpdate({ previous: undefined, checkedAt, update: { windows: [weekly] } }),
-    ).toEqual({ checkedAt, windows: [weekly], unavailable: { reason: "probeFailed" } });
+    ).toEqual({ checkedAt, windows: [weekly] });
+  });
+
+  it("preserves credential fingerprints and external usage through a sparse update", () => {
+    const externalUsage = { label: "Usage dashboard", url: "https://example.com/usage" };
+    const next = applyUsageLimitsUpdate({
+      previous: { ...published, credentialFingerprint: "fingerprint", externalUsage },
+      checkedAt: "2026-09-03T12:00:05.000Z",
+      update: { windows: [{ ...session, usedPercent: 55 }] },
+    });
+    expect(next).toMatchObject({
+      credentialFingerprint: "fingerprint",
+      externalUsage,
+    });
   });
 
   it("preserves reset credits and a $0 cap when a streamed window update changes usage", () => {

@@ -16,6 +16,8 @@ export interface UsageRecord {
   readonly timestampMs: number;
   readonly model: string;
   readonly rateModel?: string;
+  /** The provider an aggregator routed through, so Go and Console usage stay separate. */
+  readonly upstreamProviderId?: string;
   readonly sessionId: string;
   readonly totals: UsageTokenTotals;
   /** The part of `totals.cacheCreationTokens` written with a 1-hour TTL. */

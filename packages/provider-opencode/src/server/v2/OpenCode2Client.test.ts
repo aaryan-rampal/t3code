@@ -407,8 +407,15 @@ describe("OpenCode2Client usage limits", () => {
       assert.deepStrictEqual(first?.windows[4]?.modelIds, ["opencode/a"]);
       assert.strictEqual(first?.windows[3]?.modelIds, undefined);
       assert.deepStrictEqual(first?.windows[3]?.providerIds, ["opencode", "console-custom"]);
+      assert.strictEqual(first?.windows[3]?.spent, 15);
+      assert.strictEqual(first?.windows[3]?.limit, 20);
+      assert.strictEqual(first?.windows[4]?.spent, 12);
+      assert.strictEqual(first?.windows[4]?.limit, 10);
+      assert.strictEqual(first?.windows[5]?.spent, 2);
+      assert.strictEqual(first?.windows[5]?.limit, 10);
       assert.deepStrictEqual(first?.windows[7]?.modelIds, []);
       assert.include(first?.windows[7]?.label ?? "", "Most used model");
+      assert.strictEqual(first?.accountKey, workspace);
       assert.strictEqual(first?.credentialFingerprint, undefined);
       workspace = "wrk_switched";
       const next = yield* api.usageLimits("/remote/project");

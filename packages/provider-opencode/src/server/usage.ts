@@ -74,6 +74,7 @@ function parseOpenCodeMessage(
     provider: "opencode",
     timestampMs,
     model,
+    ...(providerId.length === 0 ? {} : { upstreamProviderId: providerId }),
     ...(prefix !== undefined && !model.includes("/") ? { rateModel: `${prefix}/${model}` } : {}),
     sessionId: fallback.sessionId || text(message.sessionID),
     totals,

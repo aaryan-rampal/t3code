@@ -38,6 +38,11 @@ export class BackgroundPolicy extends Context.Service<
     readonly shouldRunOpportunisticWork: Effect.Effect<boolean>;
     /** Host power and lock state only, for server-owned work that no client lease asks for. */
     readonly shouldRunHostWork: Effect.Effect<boolean>;
+    /**
+     * True while a client is connected and the host is not suspended, locked or
+     * thermally constrained. Usage-only reads use it without taking a foreground lease.
+     */
+    readonly shouldRunUsageSampling: Effect.Effect<boolean>;
   }
 >()("t3/background/BackgroundPolicy") {}
 
@@ -273,6 +278,11 @@ export const make = Effect.fn("background.policy.make")(function* () {
     (current) => current.shouldRunOpportunisticWork,
   );
 
+  const shouldRunUsageSampling = Effect.gen(function* () {
+    const [current, settings] = yield* Effect.all([snapshot, backgroundActivitySettings]);
+    return current.leases.length > 0 && !isHostConstrained(current.hostPower, settings);
+  });
+
   yield* Effect.forever(
     Effect.sleep("15 seconds").pipe(
       Effect.andThen(
@@ -299,6 +309,7 @@ export const make = Effect.fn("background.policy.make")(function* () {
     shouldRunScopeWork,
     shouldRunOpportunisticWork,
     shouldRunHostWork,
+    shouldRunUsageSampling,
   });
 });
 

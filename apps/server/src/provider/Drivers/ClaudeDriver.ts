@@ -1,6 +1,7 @@
-import { ClaudeSettings, ProviderDriverKind } from "@t3tools/contracts";
+import { ClaudeSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Cache from "effect/Cache";
 import type * as Cause from "effect/Cause";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
@@ -9,6 +10,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { HttpClient } from "effect/http";
@@ -32,12 +34,15 @@ import * as ClaudeResetCredits from "../claudeResetCredits.ts";
 import * as ResetCreditCoordinator from "../resetCreditCoordinator.ts";
 import {
   checkClaudeProviderStatus,
+  claudeAuthStatus,
   makePendingClaudeProvider,
   probeClaudeCapabilities,
   probeClaudeWorkspaceSnapshot,
+  resolveClaudeCapabilitiesUsageLimits,
   type ClaudeCapabilitiesProbe,
 } from "../ClaudeProvider.ts";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
+import { makeUnavailableUsageLimits } from "@t3tools/provider-core/server/usageLimits";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import {
   resolveClaudeModelCatalog,
@@ -67,6 +72,7 @@ import {
 } from "./ClaudeHome.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { makeClaudeMaintenanceResolution } from "./ClaudeMaintenance.ts";
+import { customClaudeApiEndpointHost, readClaudeSettingsEnv } from "./ClaudeSkills.ts";
 const decodeClaudeSettings = Schema.decodeSync(ClaudeSettings);
 
 const DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
@@ -75,6 +81,7 @@ const CAPABILITIES_PROBE_TTL = Duration.minutes(5);
 const withoutUsage = (capabilities: ClaudeCapabilitiesProbe): ClaudeCapabilitiesProbe => {
   const result = { ...capabilities };
   delete result.usage;
+  delete result.usageCheckedAt;
   return result;
 };
 
@@ -218,37 +225,49 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
     // account-specific probes never share auth metadata across instances.
     // A transient miss may reuse the last account once, but its usage windows keep their age.
     const lastGoodCapabilities = yield* Ref.make<ClaudeCapabilitiesProbe | undefined>(undefined);
+    const allowFallbackRef = yield* Ref.make(true);
+    const probeFreshCapabilities = () =>
+      probeClaudeCapabilities(effectiveConfig, processEnv, stateDir).pipe(
+        Effect.flatMap((capabilities) =>
+          ClaudeResetCredits.readClaudeOrganizationId(accountConfigPath).pipe(
+            Effect.map((workspaceId) =>
+              workspaceId === undefined ? capabilities : { ...capabilities, workspaceId },
+            ),
+          ),
+        ),
+        Effect.tap((capabilities) =>
+          Ref.set(lastGoodCapabilities, capabilities).pipe(
+            Effect.andThen(modelRoutes.record(capabilities.models ?? [])),
+          ),
+        ),
+        Effect.ensuring(modelRoutes.settle),
+      );
     const capabilitiesProbeCache = yield* Cache.makeWith(
       () =>
-        probeClaudeCapabilities(effectiveConfig, processEnv, stateDir).pipe(
-          Effect.flatMap((capabilities) =>
-            ClaudeResetCredits.readClaudeOrganizationId(accountConfigPath).pipe(
-              Effect.map((workspaceId) => ({
-                _tag: "fresh" as const,
-                capabilities:
-                  workspaceId === undefined ? capabilities : { ...capabilities, workspaceId },
-              })),
-            ),
-          ),
-          Effect.tap(({ capabilities }) =>
-            Ref.set(lastGoodCapabilities, capabilities).pipe(
-              Effect.andThen(modelRoutes.record(capabilities.models ?? [])),
-            ),
-          ),
-          Effect.ensuring(modelRoutes.settle),
+        probeFreshCapabilities().pipe(
+          Effect.map((capabilities) => ({
+            _tag: "fresh" as const,
+            capabilities,
+          })),
           Effect.catch((error) =>
-            Ref.getAndSet(lastGoodCapabilities, undefined).pipe(
-              Effect.flatMap((capabilities) =>
-                capabilities === undefined
+            Ref.get(allowFallbackRef).pipe(
+              Effect.flatMap((allowFallback) =>
+                !allowFallback
                   ? Effect.fail(error)
-                  : ClaudeResetCredits.readClaudeOrganizationId(accountConfigPath).pipe(
-                      Effect.flatMap((workspaceId) =>
-                        workspaceId === capabilities.workspaceId
-                          ? Effect.succeed({
-                              _tag: "fallback" as const,
-                              capabilities: withoutUsage(capabilities),
-                            })
-                          : Effect.fail(error),
+                  : Ref.getAndSet(lastGoodCapabilities, undefined).pipe(
+                      Effect.flatMap((capabilities) =>
+                        capabilities === undefined
+                          ? Effect.fail(error)
+                          : ClaudeResetCredits.readClaudeOrganizationId(accountConfigPath).pipe(
+                              Effect.flatMap((workspaceId) =>
+                                workspaceId === capabilities.workspaceId
+                                  ? Effect.succeed({
+                                      _tag: "fallback" as const,
+                                      capabilities: withoutUsage(capabilities),
+                                    })
+                                  : Effect.fail(error),
+                              ),
+                            ),
                       ),
                     ),
               ),
@@ -296,10 +315,18 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
                 ),
             ),
           ),
-          Effect.tap((provider) =>
+          Effect.flatMap((provider) =>
             provider.auth.status === "unauthenticated"
-              ? Cache.invalidateAll(capabilitiesProbeCache)
-              : Effect.void,
+              ? Cache.invalidateAll(capabilitiesProbeCache).pipe(Effect.as(provider))
+              : provider.auth.status === "unknown"
+                ? ClaudeResetCredits.readClaudeOrganizationId(accountConfigPath).pipe(
+                    Effect.map((workspaceId) =>
+                      workspaceId === undefined
+                        ? provider
+                        : { ...provider, auth: { ...provider.auth, workspaceId } },
+                    ),
+                  )
+                : Effect.succeed(provider),
           ),
           Effect.map(stampIdentity),
         ),
@@ -307,6 +334,64 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
       // Disabled, failed version checks and interruption never reach the probe.
       Effect.ensuring(modelRoutes.settle),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+    );
+
+    const usageSample: Effect.Effect<ServerProvider["usageLimits"]> = Effect.gen(function* () {
+      if (!effectiveConfig.enabled) return undefined;
+      const currentSnapshot = yield* snapshot.getSnapshot;
+      const previousGoodCapabilities = yield* Ref.get(lastGoodCapabilities);
+      const checkedAt = DateTime.formatIso(yield* DateTime.now);
+      yield* Cache.invalidateAll(capabilitiesProbeCache);
+      const probeResult = yield* Ref.set(allowFallbackRef, false).pipe(
+        Effect.andThen(Cache.get(capabilitiesProbeCache, capabilitiesCacheKey)),
+        Effect.ensuring(Ref.set(allowFallbackRef, true)),
+        Effect.result,
+      );
+      if (Result.isFailure(probeResult)) {
+        return currentSnapshot.auth.status === "unauthenticated"
+          ? undefined
+          : makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed" });
+      }
+      const capabilities: ClaudeCapabilitiesProbe = probeResult.success.capabilities;
+      const baseUrl =
+        (yield* readClaudeSettingsEnv(effectiveConfig, stateDir, processEnv)).ANTHROPIC_BASE_URL ??
+        processEnv.ANTHROPIC_BASE_URL;
+      const customApiEndpoint = customClaudeApiEndpointHost(baseUrl) !== undefined;
+      if (!customApiEndpoint && claudeAuthStatus(capabilities) === "unauthenticated") {
+        yield* Cache.invalidateAll(capabilitiesProbeCache);
+        yield* Ref.set(lastGoodCapabilities, undefined);
+        return undefined;
+      }
+      // Do not publish a different account's limits onto the previous snapshot's auth;
+      // wait for a full checkProvider refresh to update auth and limits together.
+      const differs = (left: string | undefined, right: string | undefined) =>
+        left !== undefined && right !== undefined && left !== right;
+      const switchedAccount =
+        differs(capabilities.email?.toLowerCase(), currentSnapshot.auth.email?.toLowerCase()) ||
+        differs(capabilities.workspaceId, currentSnapshot.auth.workspaceId);
+      if (switchedAccount) {
+        yield* Cache.invalidateAll(capabilitiesProbeCache);
+        yield* Ref.set(lastGoodCapabilities, previousGoodCapabilities);
+        return undefined;
+      }
+      const { usageLimits } = yield* resolveClaudeCapabilitiesUsageLimits({
+        capabilities,
+        checkedAt,
+        scopedLimitNames,
+        version: currentSnapshot.version,
+        resolveResetCredits: (version) =>
+          ClaudeResetCredits.readClaudeResetCredits(configDir, version).pipe(
+            Effect.provideService(HttpClient.HttpClient, httpClient),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
+          ),
+      });
+      return capabilities.workspaceId === undefined
+        ? usageLimits
+        : { ...usageLimits, accountKey: capabilities.workspaceId };
+    }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
     );
@@ -323,6 +408,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
           Effect.map(stampIdentity),
         ),
       checkProvider,
+      usageSample,
       invalidateUsageCache: Cache.invalidateAll(capabilitiesProbeCache),
       enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
         resolveMaintenance().pipe(

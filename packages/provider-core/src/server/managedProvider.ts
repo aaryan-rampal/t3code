@@ -20,6 +20,7 @@ import * as ProviderHost from "./ProviderHost.ts";
 import {
   applyUsageLimitsUpdate,
   makeUsageLimits,
+  makeUsageRead,
   resolveUsageLimitsAfterProbe,
 } from "./usageLimits.ts";
 import type { ManagedServerProvider } from "./snapshot.ts";
@@ -43,6 +44,23 @@ function withUsageLimits(
   return usageLimits ? { ...rest, usageLimits } : rest;
 }
 
+function withUsageRead(
+  snapshot: ServerProvider,
+  usageRead: ServerProvider["usageRead"],
+): ServerProvider {
+  if (snapshot.usageRead === usageRead) {
+    return snapshot;
+  }
+  const { usageRead: _previous, ...rest } = snapshot;
+  return usageRead ? { ...rest, usageRead } : rest;
+}
+
+function usageReadTime(usageRead: ServerProvider["usageRead"]): number | undefined {
+  if (usageRead === undefined) return undefined;
+  const parsed = Date.parse(usageRead.attemptedAt);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
 const FAILED_CHECK_RECHECK_DELAY = "30 seconds";
 
 /**
@@ -63,6 +81,11 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   readonly initialSnapshot: (settings: Settings) => Effect.Effect<ServerProvider>;
   readonly checkProvider: Effect.Effect<ServerProvider, ServerSettingsError>;
   readonly checkUsageLimits?: Effect.Effect<ServerProvider["usageLimits"]>;
+  /**
+   * A usage-only read for background sampling. Unlike `checkUsageLimits`, it does
+   * not make the interval retry a failed usage read in place of a provider check.
+   */
+  readonly usageSample?: Effect.Effect<ServerProvider["usageLimits"]>;
   readonly invalidateUsageCache?: Effect.Effect<void>;
   readonly enrichSnapshot?: (input: {
     readonly settings: Settings;
@@ -72,6 +95,11 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   }) => Effect.Effect<void>;
   readonly refreshInterval?: Duration.Input;
   readonly refreshOnInterval?: boolean | ((snapshot: ServerProvider) => boolean);
+  /**
+   * Runs a usage-only probe on the interval without checking the provider. Use it
+   * for providers that stay healthy indefinitely but still need periodic quota reads.
+   */
+  readonly refreshUsageOnInterval?: (snapshot: ServerProvider) => boolean;
   readonly checkProviderOnSettingsChange?: (previous: Settings, next: Settings) => boolean;
 }): Effect.fn.Return<
   ManagedServerProvider,
@@ -107,14 +135,20 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
         return [null, state] as const;
       }
       // Enrichment must not revert usage updates newer than its input snapshot.
-      const merged = withUsageLimits(
-        state.usageAuthLabel === undefined
-          ? nextSnapshot
-          : {
-              ...nextSnapshot,
-              auth: { ...nextSnapshot.auth, label: state.usageAuthLabel ?? undefined },
-            },
-        state.snapshot.usageLimits,
+      // `usageRead` moves with `usageLimits`: an enrichment carrying a fresh read
+      // outcome beside stale limits would otherwise consume the reading that the
+      // republish immediately after it publishes.
+      const merged = withUsageRead(
+        withUsageLimits(
+          state.usageAuthLabel === undefined
+            ? nextSnapshot
+            : {
+                ...nextSnapshot,
+                auth: { ...nextSnapshot.auth, label: state.usageAuthLabel ?? undefined },
+              },
+          state.snapshot.usageLimits,
+        ),
+        state.snapshot.usageRead,
       );
       if (Equal.equals(state.snapshot, merged)) {
         return [null, state] as const;
@@ -238,12 +272,29 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
                 ...probedSnapshot,
                 auth: { ...probedSnapshot.auth, label: usageAuthLabel ?? undefined },
               };
-        const snapshot = withUsageLimits(
+        const withLimits = withUsageLimits(
           workspaceId && !probedSnapshot.auth.workspaceId
             ? { ...labeledProbe, auth: { ...labeledProbe.auth, workspaceId } }
             : labeledProbe,
           usageLimits,
         );
+        // A provider that cannot read usage synchronously (Antigravity) keeps the
+        // last explicit event; a probe that reports its own outcome always wins.
+        // A push that landed mid-probe already reports the newest read.
+        const currentUsageRead = state.snapshot.usageRead;
+        const probedUsageRead = probedSnapshot.usageRead;
+        const publishedReadIsNewer =
+          !switchedAccount &&
+          currentUsageRead !== undefined &&
+          probedUsageRead !== undefined &&
+          (usageReadTime(currentUsageRead) ?? -Infinity) >
+            (usageReadTime(probedUsageRead) ?? -Infinity);
+        const usageRead = publishedReadIsNewer
+          ? currentUsageRead
+          : (probedUsageRead ??
+            (usageLimits === state.snapshot.usageLimits ? currentUsageRead : undefined));
+        const snapshot =
+          usageRead === withLimits.usageRead ? withLimits : { ...withLimits, usageRead };
         return [
           { snapshot, generation },
           { snapshot, enrichmentGeneration: generation, usageAuthLabel, checked: true },
@@ -278,10 +329,22 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
         if (usageLimits === state.snapshot.usageLimits && !relabel) {
           return [null, state] as const;
         }
-        const snapshot = withUsageLimits(
+        const withLimits = withUsageLimits(
           relabel ? { ...state.snapshot, auth: { ...auth, label } } : state.snapshot,
           usageLimits,
         );
+        // A streamed report is a notification reading, not a provider probe.
+        const usageRead =
+          usageLimits === undefined || update.windows.length === 0
+            ? withLimits.usageRead
+            : makeUsageRead({
+                attemptedAt: update.checkedAt,
+                source: "notification",
+                usageLimits,
+                ...(complete ? {} : { windowIds: update.windows.map((window) => window.id) }),
+              });
+        const snapshot =
+          usageRead === withLimits.usageRead ? withLimits : { ...withLimits, usageRead };
         return [
           snapshot,
           {
@@ -334,6 +397,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     );
   });
 
+  const usageSampleEffect = input.checkUsageLimits ?? input.usageSample;
   const needsUsageRecovery = (snapshot: ServerProvider) =>
     input.checkUsageLimits !== undefined &&
     snapshot.installed &&
@@ -345,27 +409,54 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     input.refreshOnInterval !== false &&
     (typeof input.refreshOnInterval !== "function" || input.refreshOnInterval(snapshot));
 
+  const needsUsageSample = (snapshot: ServerProvider) =>
+    input.checkUsageLimits !== undefined &&
+    input.refreshUsageOnInterval !== undefined &&
+    snapshot.enabled &&
+    input.refreshUsageOnInterval(snapshot);
+
+  // A usage-only read skips the provider check. OpenCode may borrow an idle managed
+  // server for it; the other drivers read quota without starting one.
+  const sampleUsageBase = Effect.fn("ManagedServerProvider.sampleUsage")(function* () {
+    if (!usageSampleEffect) return;
+    const probed = yield* usageSampleEffect;
+    if (probed === undefined) return;
+    const snapshotToPublish = yield* Ref.modify(snapshotStateRef, (state) => {
+      const usageLimits = resolveUsageLimitsAfterProbe({
+        published: state.snapshot.usageLimits,
+        probed,
+      });
+      const probedAt = Date.parse(probed.checkedAt);
+      const currentReadAt = usageReadTime(state.snapshot.usageRead);
+      // A push may have landed while this read was in flight.
+      const usageRead =
+        currentReadAt !== undefined && !Number.isNaN(probedAt) && currentReadAt > probedAt
+          ? state.snapshot.usageRead
+          : makeUsageRead({
+              attemptedAt: probed.checkedAt,
+              source: "probe",
+              usageLimits: probed,
+            });
+      const snapshot = { ...withUsageLimits(state.snapshot, usageLimits), usageRead };
+      return [snapshot, { ...state, snapshot }] as const;
+    });
+    yield* PubSub.publish(changesPubSub, snapshotToPublish);
+  });
+
   const refreshOnInterval = Effect.fn("ManagedServerProvider.refreshOnInterval")(function* (
     deferFailure: boolean,
   ) {
     const { snapshot } = yield* Ref.get(snapshotStateRef);
     if (!snapshot.enabled) return;
-    if (!needsUsageRecovery(snapshot) || !input.checkUsageLimits) {
-      if (needsProviderRefresh(snapshot)) {
-        yield* applySnapshotBase(yield* input.getSettings, { forceRefresh: true, deferFailure });
-      }
+    if (needsUsageRecovery(snapshot)) {
+      yield* sampleUsageBase();
       return;
     }
-    const probed = yield* input.checkUsageLimits;
-    const next = yield* Ref.modify(snapshotStateRef, (state) => {
-      const usageLimits = resolveUsageLimitsAfterProbe({
-        published: state.snapshot.usageLimits,
-        probed,
-      });
-      const snapshot = withUsageLimits(state.snapshot, usageLimits);
-      return [snapshot, { ...state, snapshot }] as const;
-    });
-    yield* PubSub.publish(changesPubSub, next);
+    if (needsProviderRefresh(snapshot)) {
+      yield* applySnapshotBase(yield* input.getSettings, { forceRefresh: true, deferFailure });
+      return;
+    }
+    if (needsUsageSample(snapshot)) yield* sampleUsageBase();
   });
 
   const shouldRefreshOnInterval = Effect.gen(function* () {
@@ -374,7 +465,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     // republish a snapshot that differs in checkedAt.
     if (
       !state.snapshot.enabled ||
-      (!needsUsageRecovery(state.snapshot) && !needsProviderRefresh(state.snapshot))
+      (!needsUsageRecovery(state.snapshot) &&
+        !needsProviderRefresh(state.snapshot) &&
+        !needsUsageSample(state.snapshot))
     ) {
       return false;
     }
@@ -471,6 +564,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
       .pipe(Effect.andThen(refreshSnapshot), Effect.tapError(Effect.logError), Effect.orDie),
     applyUsageLimits,
     refreshUsage: refreshUsage(),
+    ...(usageSampleEffect
+      ? { sampleUsage: refreshSemaphore.withPermits(1)(sampleUsageBase()) }
+      : {}),
     get streamChanges() {
       return Stream.fromPubSub(changesPubSub);
     },

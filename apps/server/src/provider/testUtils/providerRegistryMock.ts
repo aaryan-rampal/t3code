@@ -23,6 +23,8 @@ const makeProviderRegistryMock = (
     Effect.succeed(makeManualOnlyProviderMaintenanceCapabilities({ provider, packageName: null })),
   setProviderMaintenanceActionState: () => Effect.succeed(providers),
   streamChanges: Stream.empty,
+  subscribeChanges: Effect.never,
+  sampleUsage: () => Effect.void,
 });
 
 export const layer = (providers: ReadonlyArray<ServerProvider> = []) =>

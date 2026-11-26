@@ -20,6 +20,12 @@ export const ServerProviderUsageWindow = Schema.Struct({
   usedPercent: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 100 })),
   resetsAt: Schema.optional(IsoDateTime),
   windowDurationMins: Schema.optional(NonNegativeInt),
+  /**
+   * A provider-reported spend and its budget in the provider's own units, when a
+   * percentage loses them.
+   */
+  spent: Schema.optional(Schema.Finite),
+  limit: Schema.optional(Schema.Finite),
 });
 export type ServerProviderUsageWindow = typeof ServerProviderUsageWindow.Type;
 
@@ -49,6 +55,8 @@ export const ServerProviderUsageLimits = Schema.Struct({
   windows: ForwardCompatibleArray(ServerProviderUsageWindow),
   /** A $0 monthly spend cap has no percentage, so it cannot be a window. */
   zeroSpendCap: Schema.optional(Schema.Boolean),
+  /** An opaque provider account identity for local history, never an email or credential. */
+  accountKey: Schema.optional(TrimmedNonEmptyString),
   credentialFingerprint: Schema.optional(TrimmedNonEmptyString),
   resetCredits: Schema.optional(ServerProviderResetCredits),
   externalUsage: Schema.optional(
@@ -65,6 +73,18 @@ export const ServerProviderUsageLimits = Schema.Struct({
   ),
 });
 export type ServerProviderUsageLimits = typeof ServerProviderUsageLimits.Type;
+
+/**
+ * The most recent attempt to read usage, kept apart from the cached `usageLimits`
+ * timestamp so a failed read is visible while the last good values remain published.
+ */
+export const ServerProviderUsageRead = Schema.Struct({
+  attemptedAt: IsoDateTime,
+  source: Schema.Literals(["probe", "notification"]),
+  outcome: Schema.Literals(["success", "failed", "unsupported"]),
+  windowIds: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+});
+export type ServerProviderUsageRead = typeof ServerProviderUsageRead.Type;
 
 /** Partial updates merge windows by id; omitted windows remain unchanged. */
 export const ProviderUsageLimitsUpdate = Schema.Struct({

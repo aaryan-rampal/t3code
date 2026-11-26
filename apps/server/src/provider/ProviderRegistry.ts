@@ -72,6 +72,9 @@ export class ProviderRegistry extends Context.Service<
       instanceId: ProviderInstanceId,
     ) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
+    /** Runs an instance's usage-only read when its driver has one; never checks the provider. */
+    readonly sampleUsage: (instanceId: ProviderInstanceId) => Effect.Effect<void>;
+
     /** Re-reads secret-backed environments first, so a fixed secret applies without a restart. */
     readonly reloadSecretsAndRefresh: (
       instanceId?: ProviderInstanceId,
@@ -143,6 +146,12 @@ export class ProviderRegistry extends Context.Service<
     }) => Effect.Effect<ReadonlyArray<ServerProvider>>;
 
     readonly streamChanges: Stream.Stream<ReadonlyArray<ServerProvider>>;
+    /** Subscribe before reading so a publication between the two is still observed. */
+    readonly subscribeChanges: Effect.Effect<
+      PubSub.Subscription<ReadonlyArray<ServerProvider>>,
+      never,
+      Scope.Scope
+    >;
   }
 >()("t3/provider/ProviderRegistry") {}
 
@@ -1449,6 +1458,13 @@ export const layer = Layer.effect(
       refreshAfterUpdate,
       runtimeModeLimits,
       invalidateModelCaches,
+      sampleUsage: (instanceId) =>
+        instanceRegistry.getInstance(instanceId).pipe(
+          Effect.flatMap((instance) => instance?.snapshot.sampleUsage ?? Effect.void),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Provider usage sample failed", { instanceId, cause }),
+          ),
+        ),
       refreshModelCatalog: refreshModelCatalog().pipe(
         Effect.catchCause(recoverRefreshFailure),
         Effect.asVoid,
@@ -1458,6 +1474,7 @@ export const layer = Layer.effect(
       get streamChanges() {
         return Stream.fromPubSub(changesPubSub);
       },
+      subscribeChanges: PubSub.subscribe(changesPubSub),
     } satisfies ProviderRegistry["Service"];
   }),
 );
