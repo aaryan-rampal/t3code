@@ -96,21 +96,22 @@ function ranAsPrompt(reply: typeof Reply.Type): boolean {
 }
 
 /**
- * Reads Antigravity limits by asking the official CLI for `/usage`; T3 never calls Google's APIs or
- * reads its credentials. `agy` ignores GEMINI_HOME here, so every instance reports the account of
- * the CLI's own sign-in, which is wrong for an instance signed in to another one. That sign-in
- * belongs to the user's `agy`, not the copy T3 installs, so `command` is looked up on PATH.
+ * Asks the official CLI for `/usage`, so T3 never calls Google's APIs or reads its credentials.
+ * `agy` ignores GEMINI_HOME, so every instance reports the user's own CLI sign-in, which is why
+ * `command` is looked up on PATH. `bareHome` is reused because `agy` keeps its install ID there.
  */
 export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(function* (input: {
   readonly authMethod: AntigravitySettings["authMethod"];
   readonly environment: NodeJS.ProcessEnv;
   readonly command: string;
+  readonly bareHome: string;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const platform = yield* HostProcess.Platform;
-  const command = expandHomePath(input.command, yield* HostProcess.HomeDirectory);
+  const userHome = yield* HostProcess.HomeDirectory;
+  const command = expandHomePath(input.command, userHome);
   let spentQuota = false;
 
   const environment: NodeJS.ProcessEnv = {
@@ -126,12 +127,28 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
   const failed = (checkedAt: string, message: string) =>
     makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed", message });
 
-  const run = (executablePath: string, args: ReadonlyArray<string>, cwd: string) =>
+  /** Starts none of the user's MCP servers or hooks; only the sign-in's keychain is linked. */
+  const bareEnvironment = Effect.gen(function* () {
+    // Elsewhere the sign-in can live in a file under the real home.
+    if (platform !== "darwin") return environment;
+    const library = path.join(input.bareHome, "Library");
+    const link = path.join(library, "Keychains");
+    if (Option.isNone(yield* Effect.option(fs.readLink(link)))) {
+      yield* fs.makeDirectory(library, { recursive: true });
+      yield* fs.symlink(path.join(userHome, "Library", "Keychains"), link);
+    }
+    return { ...environment, HOME: input.bareHome };
+  });
+
+  const run = (
+    executablePath: string,
+    args: ReadonlyArray<string>,
+    options: { readonly cwd: string; readonly env: NodeJS.ProcessEnv },
+  ) =>
     spawnAndCollect(
       executablePath,
       ChildProcess.make(executablePath, args, {
-        cwd,
-        env: environment,
+        ...options,
         extendEnv: false,
         stdin: "ignore",
       }),
@@ -156,16 +173,18 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     }
     // Removed with the scope, so periodic reads leave no CLI logs behind.
     const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-usage-" });
-    const version = (yield* run(executablePath, ["--version"], cwd)).stdout.trim();
+    const version = (yield* run(executablePath, ["--version"], {
+      cwd,
+      env: environment,
+    })).stdout.trim();
     if (!parseSemver(version) || compareSemverVersions(version, MINIMUM_VERSION) < 0) {
       return failed(checkedAt, `Update agy to ${MINIMUM_VERSION} or newer to see limits.`);
     }
     const args = ["-p", "/usage", "--output-format", "json", "--print-timeout", "20s"];
-    const output = yield* run(
-      executablePath,
-      [...args, "--log-file", path.join(cwd, "agy.log")],
+    const output = yield* run(executablePath, [...args, "--log-file", path.join(cwd, "agy.log")], {
       cwd,
-    );
+      env: yield* bareEnvironment,
+    });
     const reply = yield* decodeReply(output.stdout);
     if (ranAsPrompt(reply)) {
       spentQuota = true;

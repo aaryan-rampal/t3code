@@ -577,6 +577,7 @@ export const AntigravityDriver: ProviderDriver<
       authMethod: auth.authMethod,
       environment: processEnvironment,
       command: settings.binaryPath.trim() || "agy",
+      bareHome: path.join(profileDirectory, "usage-cli-home"),
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),

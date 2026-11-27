@@ -61,6 +61,7 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     readonly command?: string;
     readonly exitCode?: number;
     readonly authMethod?: "oauth-personal" | "gemini-api-key";
+    readonly platform?: NodeJS.Platform;
   } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
@@ -69,6 +70,8 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
   const executablePath = path.join(directory, "agy");
   const callsPath = path.join(directory, "calls");
   const replyPath = path.join(directory, "reply.json");
+  const userHome = path.join(directory, "user-home");
+  const bareHome = path.join(directory, "bare-home");
   yield* fs.writeFileString(replyPath, JSON.stringify(options.reply ?? usageReply));
   yield* fs.writeFileString(
     executablePath,
@@ -76,7 +79,7 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
       "#!/bin/sh",
       `[ "$1" = --version ] && { echo '${options.version ?? "1.5.18"}'; exit 0; }`,
       `echo "args=$* ssh=$SSH_CONNECTION update=$AGY_CLI_DISABLE_AUTO_UPDATE` +
-        ` key=$GEMINI_API_KEY$google_api_key stdin=$(cat)" >>'${callsPath}'`,
+        ` key=$GEMINI_API_KEY$google_api_key home=$HOME stdin=$(cat)" >>'${callsPath}'`,
       `cat '${replyPath}'`,
       `exit ${options.exitCode ?? 0}`,
     ].join("\n"),
@@ -90,12 +93,16 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
       google_api_key: "leaked",
     },
     command: options.command ?? "agy",
-  });
+    bareHome,
+  }).pipe(
+    Effect.provideService(HostProcess.Platform, options.platform ?? "linux"),
+    Effect.provideService(HostProcess.HomeDirectory, userHome),
+  );
   const calls = fs.readFileString(callsPath).pipe(
     Effect.map((text) => text.trim().split("\n")),
     Effect.orElseSucceed((): string[] => []),
   );
-  return { probe, calls };
+  return { probe, calls, userHome, bareHome };
 });
 
 describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
@@ -135,8 +142,37 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
         const [call, ...rest] = yield* calls;
         expect(rest).toEqual([]);
         expect(call).toContain("-p /usage --output-format json --print-timeout 20s --log-file ");
-        expect(call).toContain("ssh=127.0.0.1 0 127.0.0.1 0 update=true key= stdin=");
+        expect(call).toContain("ssh=127.0.0.1 0 127.0.0.1 0 update=true key= home=");
         expect(call).not.toContain("--disable-slash-commands");
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+
+    it.live("runs agy bare on macOS: a reused home that only links the keychain", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { probe, calls, userHome, bareHome } = yield* fixture({ platform: "darwin" });
+
+        yield* probe;
+        expect((yield* probe).windows).toHaveLength(3);
+
+        expect(yield* fs.readLink(path.join(bareHome, "Library", "Keychains"))).toBe(
+          path.join(userHome, "Library", "Keychains"),
+        );
+        expect(yield* fs.readDirectory(bareHome)).toEqual(["Library"]);
+        for (const call of yield* calls) expect(call).toContain(`home=${bareHome} `);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+
+    it.live("leaves HOME alone where the sign-in is not found through a keychain", () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const { probe, calls, bareHome } = yield* fixture({ platform: "linux" });
+
+        yield* probe;
+
+        expect(yield* fs.exists(bareHome)).toBe(false);
+        expect((yield* calls)[0]).not.toContain(bareHome);
       }).pipe(Effect.provide(NodeServices.layer)),
     );
 
