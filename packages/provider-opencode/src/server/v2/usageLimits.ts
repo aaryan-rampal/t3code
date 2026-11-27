@@ -130,10 +130,10 @@ export const readServerUsageLimits = Effect.fn("OpenCode2Client.usageLimits")(fu
       : [];
     const windows: ServerProviderUsageWindow[] = [];
     if (go) {
-      for (const [key, kind, label, duration] of [
+      for (const [key, kind, label, windowDurationMins] of [
         ["rolling", "session", "Session", 300],
         ["weekly", "weekly", "Weekly", 10080],
-        ["monthly", "monthly", "Monthly", undefined],
+        ["monthly", "monthly", "Monthly", 43200],
       ] as const) {
         const meter = go[key];
         windows.push({
@@ -142,7 +142,7 @@ export const readServerUsageLimits = Effect.fn("OpenCode2Client.usageLimits")(fu
           label: `Go · ${label}`,
           usedPercent: meter.limited ? 100 : clampPercent(meter.percent),
           resetsAt: resetTime(meter.resetsAt),
-          ...(duration === undefined ? {} : { windowDurationMins: duration }),
+          windowDurationMins,
         });
       }
     }

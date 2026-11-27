@@ -91,15 +91,16 @@ it.effect("reads Go limits with the instance's XDG credentials and preserves res
       "aba48e85c981a8edc1c9fb4575121accc7235fa55d0f8689f66f153de5566a37",
     );
     NodeAssert.deepEqual(
-      limits.windows.map(({ kind, usedPercent, resetsAt: reset }) => ({
+      limits.windows.map(({ kind, windowDurationMins, usedPercent, resetsAt: reset }) => ({
         kind,
+        windowDurationMins,
         usedPercent,
         reset,
       })),
       [
-        { kind: "session", usedPercent: 0, reset: resetsAt },
-        { kind: "weekly", usedPercent: 10, reset: resetsAt },
-        { kind: "monthly", usedPercent: 100, reset: resetsAt },
+        { kind: "session", windowDurationMins: 300, usedPercent: 0, reset: resetsAt },
+        { kind: "weekly", windowDurationMins: 10080, usedPercent: 10, reset: resetsAt },
+        { kind: "monthly", windowDurationMins: 43200, usedPercent: 100, reset: resetsAt },
       ],
     );
   }),

@@ -172,6 +172,7 @@ export const readOpenCodeGoUsageLimits = Effect.fn("readOpenCodeGoUsageLimits")(
         id: "go_monthly",
         kind: "monthly",
         label: "Go · Monthly",
+        windowDurationMins: 30 * 24 * 60,
         usedPercent: clampPercent(body.usage.monthly.percent),
         resetsAt: DateTime.formatIso(body.usage.monthly.resetsAt),
       },

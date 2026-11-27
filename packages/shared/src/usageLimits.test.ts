@@ -219,6 +219,21 @@ describe("pace", () => {
     expect(paceOf({ ...window, usedPercent: 62 }, now)).toBe("on");
     expect(paceOf({ ...window, usedPercent: 80 }, now)).toBe("ahead");
   });
+  it("computes pace for a 30-day monthly window such as OpenCode Go monthly", () => {
+    const monthly = {
+      id: "go_monthly",
+      kind: "monthly",
+      label: "Go · Monthly",
+      usedPercent: 20,
+      windowDurationMins: 30 * 24 * 60,
+      resetsAt: "2026-09-27T12:00:00.000Z",
+    } as const;
+    expect(elapsedShare(monthly, now)).toBeCloseTo(0.2);
+    expect(paceRemainingPercent(monthly, now)).toBe(80);
+    expect(paceOf(monthly, now)).toBe("on");
+    expect(paceOf({ ...monthly, usedPercent: 10 }, now)).toBe("under");
+    expect(paceOf({ ...monthly, usedPercent: 51 }, now)).toBe("ahead");
+  });
 });
 
 describe("pools", () => {

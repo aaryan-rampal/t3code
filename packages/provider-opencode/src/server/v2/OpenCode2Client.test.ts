@@ -399,6 +399,10 @@ describe("OpenCode2Client usage limits", () => {
         first?.windows.map((window) => window.usedPercent),
         [23, 100, 12, 75, 100, 20, 100, 100],
       );
+      assert.deepStrictEqual(
+        first?.windows.slice(0, 3).map((window) => window.windowDurationMins),
+        [300, 10080, 43200],
+      );
       assert.isTrue(
         first?.windows.every((window) => window.resetsAt === "2026-11-01T00:00:00.000Z"),
       );
