@@ -132,6 +132,8 @@ Claude resets are not available when the server runs on macOS, where Claude keep
 Keychain. On narrow screens, numbered rows below
 the bar show each account's quota, countdown, and credits. Tap a row to open its details.
 
+Antigravity limits come from the `agy` CLI on the server, version 1.1.11 or newer, with a Google account sign-in. They belong to the account `agy` is signed in to by default, even for an Antigravity provider in T3 Code that uses a different account. If limits are missing, run `agy` in a terminal on that machine and sign in.
+
 The same account signed in on more than one environment, or reported by a hub as well, counts once.
 Filter with the environment dropdown to see what a single machine has.
 
