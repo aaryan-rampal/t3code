@@ -576,7 +576,7 @@ export const AntigravityDriver: ProviderDriver<
     const usage = yield* makeAntigravityUsageProbe({
       authMethod: auth.authMethod,
       environment: processEnvironment,
-      executable: installation.resolve(settings.binaryPath, processEnvironment),
+      command: settings.binaryPath.trim() || "agy",
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),

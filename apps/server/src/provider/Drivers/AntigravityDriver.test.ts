@@ -90,6 +90,11 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
   const directories = yield* resolveAntigravityInstanceDirectories(config.stateDir, instanceId);
   const profileDirectory = directories.profile;
   const instancePath = `${path.join(root, "instance-bin")}:${baseEnv.PATH ?? ""}`;
+  // Usage reads run `agy` from PATH; this one keeps them away from a real signed-in CLI.
+  const usageCli = path.join(root, "instance-bin", "agy");
+  yield* fs.makeDirectory(path.dirname(usageCli), { recursive: true });
+  yield* fs.writeFileString(usageCli, "#!/bin/sh\nexit 1\n");
+  yield* fs.chmod(usageCli, 0o755);
 
   const agentExecutables = new Set<string>();
   const makeExecutable = Effect.fn("AntigravityDriverTest.makeExecutable")(function* (
@@ -205,6 +210,8 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
       if (command._tag !== "StandardCommand")
         return yield* Effect.die("Unexpected process pipeline.");
       const handle = yield* spawner.spawn(command);
+      // Background usage reads are not agent launches.
+      if (command.command === usageCli) return handle;
       const environment = command.options.env ?? {};
       const env = (name: string) => {
         const value = environment[name];

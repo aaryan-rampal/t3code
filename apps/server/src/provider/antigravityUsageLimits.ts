@@ -3,8 +3,11 @@ import {
   makeUnavailableUsageLimits,
   makeUsageLimits,
 } from "@t3tools/provider-core/server/usageLimits";
+import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { compareSemverVersions, parseSemver } from "@t3tools/shared/semver";
+import { resolveCommandPath } from "@t3tools/shared/shell";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -21,12 +24,12 @@ const WINDOWS = {
   weekly: { kind: "weekly", label: "Weekly", minutes: 7 * 24 * 60 },
 } as const;
 /** These would move `agy` off the Google account whose quota this instance reports. */
-const OTHER_CREDENTIAL_KEYS = [
+const OTHER_CREDENTIAL_KEYS = new Set([
   "GEMINI_API_KEY",
   "GOOGLE_API_KEY",
   "GOOGLE_APPLICATION_CREDENTIALS",
   "GOOGLE_GENAI_USE_VERTEXAI",
-];
+]);
 
 const Bucket = Schema.Struct({
   id: Schema.NonEmptyString,
@@ -95,21 +98,19 @@ function ranAsPrompt(reply: typeof Reply.Type): boolean {
 /**
  * Reads Antigravity limits by asking the official CLI for `/usage`; T3 never calls Google's APIs or
  * reads its credentials. `agy` ignores GEMINI_HOME here, so every instance reports the account of
- * the CLI's own sign-in in `~/.gemini`, which is wrong for an instance signed in to another one.
+ * the CLI's own sign-in, which is wrong for an instance signed in to another one. That sign-in
+ * belongs to the user's `agy`, not the copy T3 installs, so `command` is looked up on PATH.
  */
-export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(function* <
-  E,
->(input: {
+export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(function* (input: {
   readonly authMethod: AntigravitySettings["authMethod"];
   readonly environment: NodeJS.ProcessEnv;
-  readonly executable: Effect.Effect<
-    { readonly executablePath: string; readonly version: string | null },
-    E
-  >;
+  readonly command: string;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const platform = yield* HostProcess.Platform;
+  const command = expandHomePath(input.command, yield* HostProcess.HomeDirectory);
   let spentQuota = false;
 
   const environment: NodeJS.ProcessEnv = {
@@ -118,7 +119,9 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     SSH_CONNECTION: input.environment.SSH_CONNECTION || "127.0.0.1 0 127.0.0.1 0",
     AGY_CLI_DISABLE_AUTO_UPDATE: "true",
   };
-  for (const key of OTHER_CREDENTIAL_KEYS) delete environment[key];
+  for (const key of Object.keys(environment)) {
+    if (OTHER_CREDENTIAL_KEYS.has(key.toUpperCase())) delete environment[key];
+  }
 
   const failed = (checkedAt: string, message: string) =>
     makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed", message });
@@ -143,13 +146,17 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     if (spentQuota) {
       return failed(checkedAt, "agy treated /usage as a prompt, so T3 stopped reading limits.");
     }
-    const executable = yield* input.executable;
-    const { executablePath } = executable;
+    const executablePath = yield* resolveCommandPath(command, { env: environment }).pipe(
+      Effect.provideService(HostProcess.Platform, platform),
+      Effect.provideService(FileSystem.FileSystem, fs),
+      Effect.provideService(Path.Path, path),
+    );
+    if (executablePath === null) {
+      return failed(checkedAt, "Install the agy CLI and sign in to see limits.");
+    }
     // Removed with the scope, so periodic reads leave no CLI logs behind.
     const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-usage-" });
-    // T3 knows its own installs' versions, but not one found on PATH or set by the user.
-    const version =
-      executable.version ?? (yield* run(executablePath, ["--version"], cwd)).stdout.trim();
+    const version = (yield* run(executablePath, ["--version"], cwd)).stdout.trim();
     if (!parseSemver(version) || compareSemverVersions(version, MINIMUM_VERSION) < 0) {
       return failed(checkedAt, `Update agy to ${MINIMUM_VERSION} or newer to see limits.`);
     }

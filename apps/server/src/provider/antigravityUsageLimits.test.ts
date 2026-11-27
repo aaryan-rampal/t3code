@@ -55,9 +55,10 @@ const usageReply = {
 const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
   options: {
     readonly reply?: unknown;
-    readonly version?: string | null;
     /** What `agy --version` prints. */
-    readonly reportedVersion?: string;
+    readonly version?: string;
+    /** The command T3 runs; the stand-in is installed as `agy` on PATH. */
+    readonly command?: string;
     readonly exitCode?: number;
     readonly authMethod?: "oauth-personal" | "gemini-api-key";
   } = {},
@@ -73,9 +74,9 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     executablePath,
     [
       "#!/bin/sh",
-      `[ "$1" = --version ] && { echo '${options.reportedVersion ?? "1.5.18"}'; exit 0; }`,
+      `[ "$1" = --version ] && { echo '${options.version ?? "1.5.18"}'; exit 0; }`,
       `echo "args=$* ssh=$SSH_CONNECTION update=$AGY_CLI_DISABLE_AUTO_UPDATE` +
-        ` key=$GEMINI_API_KEY stdin=$(cat)" >>'${callsPath}'`,
+        ` key=$GEMINI_API_KEY$google_api_key stdin=$(cat)" >>'${callsPath}'`,
       `cat '${replyPath}'`,
       `exit ${options.exitCode ?? 0}`,
     ].join("\n"),
@@ -83,11 +84,12 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
   yield* fs.chmod(executablePath, 0o755);
   const { probe } = yield* makeAntigravityUsageProbe({
     authMethod: options.authMethod ?? "oauth-personal",
-    environment: { PATH: "/usr/bin:/bin", GEMINI_API_KEY: "leaked" },
-    executable: Effect.succeed({
-      executablePath,
-      version: options.version === undefined ? "1.5.14" : options.version,
-    }),
+    environment: {
+      PATH: `${directory}:/usr/bin:/bin`,
+      GEMINI_API_KEY: "leaked",
+      google_api_key: "leaked",
+    },
+    command: options.command ?? "agy",
   });
   const calls = fs.readFileString(callsPath).pipe(
     Effect.map((text) => text.trim().split("\n")),
@@ -138,19 +140,10 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")(
       }).pipe(Effect.provide(NodeServices.layer)),
     );
 
-    it.live("asks an agy found on PATH for its version before reading", () =>
-      Effect.gen(function* () {
-        const { probe, calls } = yield* fixture({ version: null });
-
-        expect((yield* probe).windows).toHaveLength(3);
-        expect(yield* calls).toHaveLength(1);
-      }).pipe(Effect.provide(NodeServices.layer)),
-    );
-
     it.live.each<[string, Parameters<typeof fixture>[0], string]>([
       ["an agy that predates /usage in print mode", { version: "1.1.10" }, "probeFailed"],
-      ["an old agy found on PATH", { version: null, reportedVersion: "1.1.10" }, "probeFailed"],
       ["an agy whose version is not a version", { version: "runtime two" }, "probeFailed"],
+      ["a command that is not installed", { command: "agy-missing" }, "probeFailed"],
       ["an API key instance", { authMethod: "gemini-api-key" }, "unsupported"],
     ])("never runs %s", ([, options, reason]) =>
       Effect.gen(function* () {
