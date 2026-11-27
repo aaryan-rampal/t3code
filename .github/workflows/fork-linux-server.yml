@@ -1,0 +1,97 @@
+# Builds the Linux x64 server runtime archive from this fork for a self-hosted
+# `t3code.service`. It publishes nothing: the archive is a workflow artifact.
+# No Clerk or relay settings are passed, so the build has no T3 Connect or
+# relay tracing configuration.
+name: Fork Linux server archive
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/linux-server-archive
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-linux-server-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build linux-x64 server archive
+    if: github.repository != 'pingdotgg/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      T3CODE_TELEMETRY_CHANNEL: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts...
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.95.0"
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Read server version
+        id: version
+        run: echo "version=$(jq -r .version apps/server/package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Build resource monitor
+        run: >-
+          cargo build --locked --release
+          --manifest-path native/resource-monitor/Cargo.toml
+          --target x86_64-unknown-linux-gnu
+
+      - name: Stage resource monitor
+        run: |
+          set -euo pipefail
+          target_dir="$RUNNER_TEMP/cli-resource-monitor/linux-x64"
+          mkdir -p "$target_dir"
+          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor \
+            "$target_dir/t3-resource-monitor"
+
+      # Builds the web client into apps/server/dist/client alongside the server bundle.
+      - name: Build server and web bundle
+        run: vp run --filter t3 build
+
+      - name: Build CLI single-executable
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      # The Linux archive ships libatomic.so.1 and points t3's RUNPATH at it.
+      - name: Install patchelf
+        run: command -v patchelf || { sudo apt-get update && sudo apt-get install -y patchelf; }
+
+      - name: Build CLI archive
+        run: >-
+          node scripts/build-cli-archive.ts
+          --platform linux --arch x64
+          --version "${{ steps.version.outputs.version }}"
+          --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor"
+          --output-dir release-cli
+
+      - name: Smoke-test CLI archive
+        run: >-
+          node scripts/smoke-cli-archive.ts
+          --archive release-cli/*
+          --expect-version "${{ steps.version.outputs.version }}"
+
+      - name: Upload CLI archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: t3-linux-x64-${{ steps.version.outputs.version }}-${{ github.sha }}
+          path: release-cli/*
+          if-no-files-found: error
+          retention-days: 14
